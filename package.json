@@ -1,0 +1,17 @@
+{
+  "name": "voidrunner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "VOIDRUNNER - a top-down sci-fi extraction roguelite rendered on HTML5 canvas with zero runtime dependencies.",
+  "scripts": {
+    "start": "node tools/serve.mjs",
+    "dev": "node tools/serve.mjs",
+    "test": "node tools/test.mjs",
+    "verify": "node tools/test.mjs && node tools/smoke.mjs",
+    "assets": "node tools/gen-assets.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

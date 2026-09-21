@@ -1,0 +1,138 @@
+/* VOIDRUNNER shell styles. The game renders entirely to canvas; this file only
+   handles the page frame, the boot overlay and text selection/cursor rules. */
+
+:root {
+  --void: #05070b;
+  --deep: #0a0e14;
+  --accent: #7fe6ff;
+  --text: #dce6f2;
+  --dim: #7d8ea3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--void);
+  color: var(--text);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  /* Prevent accidental text selection while dragging to aim. */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+#game-root {
+  position: fixed;
+  inset: 0;
+  display: block;
+  background: radial-gradient(circle at 30% 40%, #0b1420 0%, #05070b 70%);
+}
+
+#game-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  outline: none;
+  image-rendering: auto;
+  cursor: crosshair;
+}
+
+#game-canvas:focus-visible {
+  box-shadow: inset 0 0 0 2px rgba(127, 230, 255, 0.5);
+}
+
+#boot-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--void);
+  transition: opacity 320ms ease;
+  z-index: 10;
+}
+
+#boot-overlay.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.boot-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  animation: boot-fade 500ms ease both;
+}
+
+.boot-logo {
+  font-family: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
+  font-size: 42px;
+  font-weight: 800;
+  letter-spacing: 10px;
+  color: var(--text);
+}
+
+.boot-logo span {
+  color: var(--accent);
+}
+
+.boot-bar {
+  width: 260px;
+  height: 3px;
+  background: rgba(127, 230, 255, 0.14);
+  overflow: hidden;
+  position: relative;
+}
+
+.boot-fill {
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: boot-scan 1.1s ease-in-out infinite;
+}
+
+.boot-status {
+  font-family: "Cascadia Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 3px;
+  color: var(--dim);
+}
+
+@keyframes boot-scan {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+@keyframes boot-fade {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .boot-fill {
+    animation: none;
+    width: 100%;
+  }
+}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="VOIDRUNNER — a top-down sci-fi extraction roguelite. Explore, fight, loot, and extract before you die." />
+    <title>VOIDRUNNER</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0e14'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%237fe6ff' stroke-width='3'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%237fe6ff'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="game-root">
+      <canvas id="game-canvas" aria-label="VOIDRUNNER game viewport" role="application" tabindex="0"></canvas>
+      <div id="boot-overlay">
+        <div class="boot-inner">
+          <div class="boot-logo">VOID<span>RUNNER</span></div>
+          <div class="boot-bar"><div class="boot-fill"></div></div>
+          <div class="boot-status">INITIALISING SYSTEMS…</div>
+        </div>
+      </div>
+    </div>
+    <noscript>
+      <div style="font: 14px system-ui; color: #dce6f2; background: #0a0e14; padding: 24px">
+        VOIDRUNNER requires JavaScript.
+      </div>
+    </noscript>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
