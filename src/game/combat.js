@@ -11,6 +11,7 @@ import { gaussian } from '../core/math.js';
 import { TEAM, queryRadius } from '../weapons/projectile.js';
 import { WEAPON_TIER_COLORS } from '../config/weapons.js';
 import { SFX } from '../audio/audio.js';
+import { ENEMY_STATES, massFeedback } from '../config/enemies.js';
 import { RARITY_COLORS } from '../config/balance.js';
 import { PLAYER_BASE } from '../config/balance.js';
 
@@ -76,7 +77,9 @@ export class CombatSystem {
     if (!weapon) return false;
     const started = weapon.beginReload(player.ammo.get(weapon.def.ammo), { reloadMul: player.reloadMul });
     if (started) {
-      run.audio.play(SFX.RELOAD_START);
+      // Reload pitch follows the class too, so the mag-out/mag-in pair belongs
+      // to the weapon and not to "guns in general".
+      run.audio.play(SFX.RELOAD_START, { rate: (FIRE_PROFILE[weapon.def.id] ?? FIRE_PROFILE.default).reloadPitch });
       run.events.emit('weapon:reloadStart', { weaponId: weapon.id });
     }
     return started;
@@ -92,7 +95,7 @@ export class CombatSystem {
     if (loaded > 0) {
       player.ammo.take(type, loaded);
       player.stats.reloads += 1;
-      run.audio.play(SFX.RELOAD_FINISH);
+      run.audio.play(SFX.RELOAD_FINISH, { rate: (FIRE_PROFILE[player.weapon?.def?.id] ?? FIRE_PROFILE.default).reloadPitch });
       run.floatingText.push(player.x, player.y - 30, `RELOADED`, { color: '#9fb3c8', size: 11 });
     } else {
       // Nothing left in reserve: surface it instead of silently doing nothing.
@@ -110,8 +113,30 @@ export class CombatSystem {
 
     const muzzleDistance = player.radius + 12;
     const baseAngle = player.aimAngle;
-    const muzzleX = player.x + Math.cos(baseAngle) * muzzleDistance;
-    const muzzleY = player.y + Math.sin(baseAngle) * muzzleDistance;
+    const dirX = Math.cos(baseAngle);
+    const dirY = Math.sin(baseAngle);
+    // Point blank. The muzzle sits `player.radius + 12` ahead of the player, so
+    // a hostile that is already in contact sits *behind* the spawn point and the
+    // shot passes straight through it (measured before this clamp: 0% hits
+    // inside 13u, 100% from 20u). Starting the projectile inside the nearest
+    // body on the firing line keeps the shot where the player aimed it; the
+    // muzzle flash and tracer origin move with it, so a contact shot reads as a
+    // contact shot instead of a whiff.
+    let startDistance = muzzleDistance;
+    for (const enemy of run.spawner.enemies) {
+      if (!enemy.alive) continue;
+      const ex = enemy.x - player.x;
+      const ey = enemy.y - player.y;
+      const along = ex * dirX + ey * dirY;
+      const body = enemy.radius + 1;
+      if (along < 0 || along > muzzleDistance + body) continue;
+      const perp = Math.abs(ex * dirY - ey * dirX);
+      if (perp > body) continue;
+      const near = along - Math.sqrt(Math.max(0, body * body - perp * perp));
+      startDistance = Math.min(startDistance, Math.max(0, near + 1));
+    }
+    const muzzleX = player.x + dirX * startDistance;
+    const muzzleY = player.y + dirY * startDistance;
 
     for (let i = 0; i < shot.pellets; i += 1) {
       const spreadSample = shot.pellets > 1
@@ -145,30 +170,50 @@ export class CombatSystem {
     if (shot.critical) player.stats.shotsFired += 0;
     // Recoil: camera kick scaled by weapon and handling upgrades.
     const kick = def.recoil * player.recoilMul;
-    run.camera.addKick(-Math.cos(baseAngle) * kick, -Math.sin(baseAngle) * kick);
+    run.camera.addKick(-dirX * kick, -dirY * kick);
     run.camera.addShake(def.recoil * 0.016 * player.recoilMul);
 
-    // Muzzle flash.
-    run.particles.spawnBurst('muzzle', muzzleX, muzzleY, def.pellets > 4 ? 8 : 4, {
+    // Muzzle flash. The shape and the report tail are per weapon class, not per
+    // archetype of "gun": without this a pistol, a rifle and a breaker read as
+    // the same weapon with different numbers, which is what the class spread
+    // ended up looking and sounding like.
+    const fx = FIRE_PROFILE[def.id] ?? FIRE_PROFILE.default;
+    run.particles.spawnBurst('muzzle', muzzleX, muzzleY, Math.round(fx.muzzle * (def.pellets > 4 ? 1.6 : 1)), {
       angle: baseAngle,
-      spread: 0.7,
-      speed: 210,
+      spread: fx.spread,
+      speed: fx.muzzleSpeed,
       life: 0.16,
       color: def.color,
-      size: def.pellets > 4 ? 4 : 2.8,
+      size: fx.muzzleSize * (def.pellets > 4 ? 1.3 : 1),
       rng: () => rng.next(),
     });
+    if (fx.trail > 0) {
+      // A short hot streak behind the flash: reads as a long barrel, not a
+      // bigger bang.
+      run.particles.spawn('muzzle', muzzleX, muzzleY, {
+        vx: dirX * -70,
+        vy: dirY * -70,
+        life: 0.1,
+        size: fx.trail,
+        color: def.color,
+        additive: true,
+        glow: 1.6,
+      });
+    }
     run.particles.spawn('smoke', muzzleX, muzzleY, {
       vx: Math.cos(baseAngle) * 30,
       vy: Math.sin(baseAngle) * 30,
-      life: 0.5,
-      size: 7,
+      life: fx.smokeLife,
+      size: fx.smokeSize,
       color: 'rgba(120,130,150,0.35)',
       additive: false,
       drag: 1.4,
     });
 
-    run.audio.play(SFX_BY_WEAPON[def.id] ?? SFX.PISTOL, { rate: 0.95 + rng.next() * 0.1 });
+    run.audio.play(SFX_BY_WEAPON[def.id] ?? SFX.PISTOL, { rate: (0.95 + rng.next() * 0.1) * fx.pitch, volume: fx.volume });
+    // Heavy classes get a low-end body under the report so weight survives the
+    // mix even when several weapons are firing at once.
+    if (fx.tail) run.audio.play(SFX.WEAPON_TAIL, { rate: fx.tail, volume: 0.55 });
     run.spawner.alertRadius(player.x, player.y, def.pellets > 4 ? 620 : 480);
     run.events.emit('weapon:fire', { weaponId: def.id, critical: shot.critical });
   }
@@ -412,10 +457,19 @@ export class CombatSystem {
     run.stats.damageDealt += applied;
     run.player.stats.damageDealt += applied;
 
-    if (run.settings.video.damageNumbers && applied > 0) {
+    // A hit can be swallowed whole by a shield, so the guard cannot be "did any
+    // damage land": the player still needs to see what the shot spent itself on.
+    if (run.settings.video.damageNumbers && (applied > 0 || result.absorbedByShield > 1)) {
       const color = crit ? '#ffd166' : explosive ? '#ffb03a' : '#ffffff';
       const size = crit ? 17 : 13;
-      run.floatingText.push(hitX, hitY - enemy.radius, `${applied}`, { color, size, critical: crit });
+      if (applied > 0) run.floatingText.push(hitX, hitY - enemy.radius, `${applied}`, { color, size, critical: crit });
+      if (result.absorbedByShield > 1) {
+        run.floatingText.push(hitX + 14, hitY - enemy.radius - 12, `-${Math.round(result.absorbedByShield)} SH`, {
+          color: '#9fe8ff',
+          size: 10,
+          life: 0.6,
+        });
+      }
       if (result.absorbedByArmor > 1) {
         run.floatingText.push(hitX + 14, hitY - enemy.radius - 12, `-${Math.round(result.absorbedByArmor)} AR`, {
           color: '#5aa9ff',
@@ -425,23 +479,54 @@ export class CombatSystem {
       }
     }
 
-    // Feedback.
-    if (result.absorbedByArmor > result.applied * 0.5) {
-      run.audio.play(SFX.HIT_ARMOR, { rate: 0.9 + run.rng.next() * 0.2 });
+    // Feedback. A shielded elite is the one case where "nothing seems to
+    // happen": the shield eats the shot, so playing the body-hit cue made the
+    // target read as invulnerable rather than protected. Shields, plates and
+    // flesh are three different materials and now sound like three different
+    // materials — a shield used to borrow the plate cue, which made a protected
+    // elite and an armoured one indistinguishable by ear.
+    const mass = massFeedback(enemy.def);
+    const shieldBefore = enemy.shield + result.absorbedByShield;
+    if (result.absorbedByShield > result.applied * 0.5 && result.absorbedByShield > 0) {
+      run.audio.play(SFX.SHIELD_HIT, { rate: 1.05 + run.rng.next() * 0.2, volume: 0.75 });
+      run.particles.spawnBurst('spark', hitX, hitY, 5, { speed: 170, life: 0.28, color: '#9fe8ff', size: 1.8, rng: () => run.rng.next() });
+      run.particles.spawnRing(hitX, hitY, enemy.radius + 6, '#9fe8ff', { life: 0.22, alpha: 0.4 });
+    } else if (result.absorbedByArmor > result.applied * 0.5) {
+      run.audio.play(SFX.HIT_ARMOR, { rate: 0.9 + run.rng.next() * 0.2, volume: 0.95 });
       run.particles.spawnBurst('spark', hitX, hitY, 4, { speed: 150, life: 0.25, color: '#bcd4ff', size: 1.6, rng: () => run.rng.next() });
     } else {
-      run.audio.play(crit ? SFX.HIT_CRIT : SFX.HIT_FLESH, { rate: 0.92 + run.rng.next() * 0.16 });
-      run.particles.spawnBurst('blood', hitX, hitY, crit ? 8 : 5, {
+      run.audio.play(crit ? SFX.HIT_CRIT : SFX.HIT_FLESH, {
+        rate: (0.92 + run.rng.next() * 0.16) * mass.hitRate,
+        volume: mass.hitVolume,
+      });
+      run.particles.spawnBurst('blood', hitX, hitY, Math.max(2, Math.round((crit ? 8 : 5) * mass.debris)), {
         angle: sourceX === null ? undefined : Math.atan2(hitY - sourceY, hitX - sourceX),
         spread: 1.2,
         speed: 150,
         life: 0.45,
         color: enemy.accent,
-        size: 2.2,
+        size: 2.2 * (0.9 + mass.debris * 0.1),
         rng: () => run.rng.next(),
       });
     }
+    // A shield that ran out gets its own cue: "the shots are working now" is a
+    // state change the player has to be able to notice mid-fight.
+    if (shieldBefore > 0 && enemy.shield <= 0 && enemy.alive) {
+      run.audio.play(SFX.SHIELD_BREAK, { volume: enemy.isBoss ? 0.9 : 0.7 });
+      run.particles.spawnRing(hitX, hitY, enemy.radius * 3.2, '#9fe8ff', { life: 0.45, alpha: 0.6 });
+      if (enemy.isElite || enemy.isBoss) {
+        run.floatingText.push(enemy.x, enemy.y - enemy.radius - 14, 'SHIELD DOWN', { color: '#9fe8ff', size: 12, life: 0.9 });
+      }
+    }
+    // Stagger is a real opening, and it used to exist only inside the AI: a
+    // heavy hit that cancelled a telegraphed attack looked like every other hit,
+    // which is exactly the moment a squad fight needs to advertise.
+    if (enemy.state === ENEMY_STATES.STAGGER && enemy.stateTime === 0 && result.applied > 0) {
+      run.audio.play(SFX.ENEMY_STAGGER, { rate: (0.96 + run.rng.next() * 0.12) * mass.hitRate, volume: 0.7 * mass.hitVolume });
+      run.particles.spawnRing(enemy.x, enemy.y, enemy.radius * (1.9 + mass.staggerLean * 0.5), '#ffffff', { life: 0.26, alpha: 0.5 });
+    }
     if (crit) run.camera.addShake(0.08);
+    else if (mass.hitShake > 1.2 && result.applied > 0) run.camera.addShake(0.1 * mass.hitShake);
 
     run.events.emit('enemy:damaged', { enemy, applied, crit });
     if (result.died) this.onEnemyDeath(enemy, weaponId);
@@ -450,18 +535,27 @@ export class CombatSystem {
 
   onEnemyDeath(enemy, weaponId) {
     const run = this.ctx;
-    run.particles.spawnBurst('debris', enemy.x, enemy.y, enemy.isElite || enemy.isBoss ? 26 : 12, {
+    const mass = massFeedback(enemy.def);
+    const elite = enemy.isElite || enemy.isBoss;
+    run.particles.spawnBurst('debris', enemy.x, enemy.y, Math.round((elite ? 26 : 12) * mass.debris), {
       speed: enemy.isBoss ? 320 : 190,
       life: 0.8,
       color: enemy.accent,
-      size: enemy.isBoss ? 3.4 : 2.4,
+      size: enemy.isBoss ? 3.4 : 2.4 * (0.9 + mass.debris * 0.1),
       rng: () => run.rng.next(),
     });
     run.particles.spawnRing(enemy.x, enemy.y, enemy.radius * (enemy.isBoss ? 6 : 2.4), enemy.accent, {
       life: enemy.isBoss ? 0.9 : 0.35,
     });
-    run.camera.addShake(enemy.isBoss ? 1.6 : enemy.isElite ? 0.28 : 0.1);
-    run.audio.play(SFX.HIT_KILL, { rate: 0.9 + run.rng.next() * 0.3, volume: enemy.isElite ? 0.7 : 0.5 });
+    run.camera.addShake((enemy.isBoss ? 1.6 : enemy.isElite ? 0.28 : 0.1) * (elite ? 1 : mass.hitShake));
+    // Kills are the most repeated sound in a run, so the cue carries the body
+    // mass: popping a dart and dropping a brute must not be the same event.
+    // Elites keep the signature kill cue, bosses have their own.
+    if (enemy.isBoss) run.audio.play(SFX.HIT_KILL, { rate: 0.72, volume: 0.6 });
+    else if (enemy.isElite) run.audio.play(SFX.HIT_KILL, { rate: 0.9 + run.rng.next() * 0.2, volume: 0.7 });
+    else if (mass.deathCue === 'heavy') run.audio.play(SFX.DEATH_HEAVY, { rate: 0.94 + run.rng.next() * 0.12, volume: 0.8 });
+    else if (mass.deathCue === 'light') run.audio.play(SFX.DEATH_LIGHT, { rate: 0.96 + run.rng.next() * 0.14, volume: 0.7 });
+    else run.audio.play(SFX.HIT_KILL, { rate: 0.96 + run.rng.next() * 0.14, volume: 0.5 });
     run.spawner.killed += 1;
     run.player.stats.kills += 1;
     run.stats.kills += 1;
@@ -504,6 +598,22 @@ export class CombatSystem {
     const stimResist = player.stimTimer > 0 ? 0.8 : 1;
     const result = player.takeDamage(amount * stimResist, { bypassArmor });
     if (result.applied <= 0 && !result.died) return result;
+    // Plating that eats most of a hit is worth hearing: without this the only
+    // cue was the same damage sting as a clean hit, and the number on screen
+    // did not say where the rest of the damage went. The armour reduction caps
+    // out below 100% by design, so this is about "mostly stopped", not "fully
+    // stopped" - which is how a plate hit actually reads.
+    const absorbedMost = !bypassArmor && result.absorbed > result.applied;
+    if (absorbedMost) {
+      run.audio.play(SFX.HIT_ARMOR, { rate: 0.82 + run.rng.next() * 0.12, volume: 0.5 });
+      run.particles.spawnBurst('spark', hitX, hitY, 5, {
+        speed: 150,
+        life: 0.28,
+        color: '#bcd4ff',
+        size: 1.7,
+        rng: () => run.rng.next(),
+      });
+    }
 
     run.stats.damageTaken += result.applied;
     run.camera.addShake(kind === 'slam' ? 1.0 : 0.3);
@@ -522,6 +632,9 @@ export class CombatSystem {
     });
     if (run.settings.video.damageNumbers) {
       run.floatingText.push(player.x, player.y - 30, `-${Math.round(result.applied)}`, { color: '#ff4d6d', size: 16 });
+      if (absorbedMost) {
+        run.floatingText.push(player.x + 14, player.y - 46, `-${Math.round(result.absorbed)} AR`, { color: '#5aa9ff', size: 11, life: 0.8 });
+      }
     }
 
     // Taking a hit interrupts an extraction channel: real extractions cost.
@@ -667,6 +780,35 @@ const SFX_BY_WEAPON = {
   railpiercer: SFX.RAIL,
   breaker: SFX.BREAKER,
   arcCaster: SFX.ARC,
+};
+
+/**
+ * Per-class fire presentation. Purely cosmetic: muzzle burst counts/sizes, the
+ * hot trail behind the flash, smoke, and where the report sits in pitch and
+ * volume. Recoil, spread, damage and cadence come from `src/config/weapons.js`
+ * and are untouched.
+ *
+ * Before this table the seven classes shared one muzzle shape and one smoke
+ * puff, so pistol/rifle/breaker differed only by colour — the closest class
+ * pairs scored 0.06-0.13 apart on a normalised fire-signature distance where 0
+ * is identical.
+ */
+const FIRE_PROFILE = {
+  default: { muzzle: 4, muzzleSize: 2.8, spread: 0.7, muzzleSpeed: 210, smokeSize: 7, smokeLife: 0.5, trail: 0, pitch: 1, volume: 1, tail: 0, reloadPitch: 1.0 },
+  // Service pistol: clean, small flash, minimal smoke.
+  pistol: { muzzle: 3, muzzleSize: 2.4, spread: 0.55, muzzleSpeed: 190, smokeSize: 5, smokeLife: 0.34, trail: 0, pitch: 1.04, volume: 0.95, tail: 0, reloadPitch: 1.05 },
+  // SMG: fast, thin, snappy — small flash but a hard short bark.
+  smg: { muzzle: 3, muzzleSize: 2.1, spread: 0.85, muzzleSpeed: 240, smokeSize: 4, smokeLife: 0.26, trail: 0, pitch: 1.18, volume: 0.85, tail: 0, reloadPitch: 1.15 },
+  // Shotgun: wide wall of flash and a long smoke plume.
+  shotgun: { muzzle: 10, muzzleSize: 4.6, spread: 1.15, muzzleSpeed: 260, smokeSize: 12, smokeLife: 0.8, trail: 0, pitch: 0.95, volume: 1, tail: 0.8, reloadPitch: 0.92 },
+  // Rifle: longer flash with a streak, a real report.
+  rifle: { muzzle: 5, muzzleSize: 3.2, spread: 0.5, muzzleSpeed: 230, smokeSize: 6, smokeLife: 0.42, trail: 3.2, pitch: 0.9, volume: 1, tail: 0.9, reloadPitch: 0.86 },
+  // Rail: a lance of light, almost no smoke, deepest pitch.
+  railpiercer: { muzzle: 4, muzzleSize: 3.6, spread: 0.2, muzzleSpeed: 320, smokeSize: 3, smokeLife: 0.3, trail: 6, pitch: 0.82, volume: 1, tail: 0.62, reloadPitch: 0.78 },
+  // Breaker: blunt, smoky, short.
+  breaker: { muzzle: 6, muzzleSize: 3.4, spread: 0.95, muzzleSpeed: 200, smokeSize: 9, smokeLife: 0.5, trail: 0, pitch: 0.88, volume: 1, tail: 0.74, reloadPitch: 0.94 },
+  // Arc caster: no muzzle bloom at all — a crackling halo instead.
+  arcCaster: { muzzle: 8, muzzleSize: 2.2, spread: 3.14, muzzleSpeed: 150, smokeSize: 2, smokeLife: 0.2, trail: 4, pitch: 1.1, volume: 0.9, tail: 0, reloadPitch: 1.1 },
 };
 
 export { TEAM, TAU };

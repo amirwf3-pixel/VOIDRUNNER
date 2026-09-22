@@ -77,6 +77,12 @@ export class WorldRuntime {
   constructor(zone) {
     this.zone = zone;
     this.props = zone.props.map((spec, index) => new Prop({ ...spec, id: index }));
+    /**
+     * Ids of destroyed props that belong to a persistent objective. Prop ids
+     * are array positions, so they are deterministic for a seed/tier but only
+     * meaningful inside the sector that produced them.
+     */
+    this.destroyedObjectiveProps = new Set();
     this.solidProps = this.props.filter((p) => p.solid);
     this.containers = this.props.filter((p) => p.kind === 'crate' || p.kind === 'console' || p.kind === 'reactor');
     this.hazards = this.props.filter((p) => p.hazard);
@@ -157,9 +163,45 @@ export class WorldRuntime {
     if (!prop || !prop.alive) return null;
     const result = prop.damage(amount);
     if (!result.destroyed) return { prop, destroyed: false, explosive: false };
+    // Objective props stay destroyed across a resume; others are transient and
+    // regenerate with the sector.
+    if (prop.objectiveId) this.destroyedObjectiveProps.add(prop.id);
     // Removing a solid prop must invalidate the broadphase bucket it lived in.
     this._rebuildGrid();
     return { prop, destroyed: true, explosive: prop.explosive };
+  }
+
+  /**
+   * Re-applies saved objective-prop destruction to a freshly generated sector.
+   * Only props that both match a saved id and belong to a persistent objective
+   * are deactivated, so an id that means something else in another sector (or
+   * in a regenerated layout) can never take an unrelated prop down with it.
+   * Objective progress is deliberately untouched: it is restored separately
+   * from `objectiveState`, which stays authoritative.
+   * @param {number[]} ids
+   * @returns {number} how many props were kept destroyed
+   */
+  restoreDestroyedProps(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) return 0;
+    const wanted = new Set(ids);
+    let restored = 0;
+    for (const prop of this.props) {
+      if (!prop.alive || !wanted.has(prop.id) || !prop.objectiveId) continue;
+      prop.alive = false;
+      prop.health = 0;
+      this.destroyedObjectiveProps.add(prop.id);
+      restored += 1;
+    }
+    if (restored > 0) {
+      this.solidProps = this.solidProps.filter((p) => p.alive);
+      this._rebuildGrid();
+    }
+    return restored;
+  }
+
+  /** Destroyed objective-prop ids in a stable order, for the run snapshot. */
+  destroyedPropIdList() {
+    return Array.from(this.destroyedObjectiveProps).sort((a, b) => a - b);
   }
 
   update(dt, context) {

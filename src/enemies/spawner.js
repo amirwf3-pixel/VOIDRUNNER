@@ -8,7 +8,7 @@
 
 import { dist2 } from '../core/math.js';
 import { BossEnemy, Enemy, resetEnemyIds } from './enemy.js';
-import { ENEMY_IDS, BOSS } from '../config/enemies.js';
+import { ENEMY_IDS, bossArenaFor } from '../config/enemies.js';
 
 const ACTIVATION_RADIUS = 760;
 const ACTIVATION_RADIUS_BOSS = 1500;
@@ -64,6 +64,9 @@ export class EnemySpawner {
 
   addEnemy(spec, { immediate = true } = {}) {
     const enemy = this._materialize(spec);
+    // Stable identity for the resume hook below: pending specs carry their
+    // index in the generator's deterministic spawn list, summoned adds do not.
+    enemy.spawnIndex = Number.isInteger(spec.index) ? spec.index : -1;
     if (!immediate) enemy.spawnGrace = Math.max(enemy.spawnGrace, 0.6);
     this.enemies.push(enemy);
     this.totalSpawned += 1;
@@ -71,16 +74,28 @@ export class EnemySpawner {
     return enemy;
   }
 
-  /** Summoned adds (boss / elite abilities). */
+  /**
+   * Summoned adds (boss / elite abilities). A single blocked position used to
+   * drop the add silently — an elite in a corridor would "summon" nothing while
+   * its one-shot ability was already spent — so each add searches a few rings
+   * around the caller before giving up.
+   */
   summon(typeId, x, y, count = 1) {
     const created = [];
     const safeType = ENEMY_IDS.includes(typeId) ? typeId : 'husk';
     for (let i = 0; i < count; i += 1) {
-      const angle = this.rng.angle();
-      const radius = 50 + this.rng.float(0, 70);
-      const sx = x + Math.cos(angle) * radius;
-      const sy = y + Math.sin(angle) * radius;
-      if (this.zone.map.circleCollides(sx, sy, 14)) continue;
+      let placed = null;
+      for (let attempt = 0; attempt < 5 && !placed; attempt += 1) {
+        const angle = this.rng.angle();
+        // Corridors are only ~96 units wide, so the first ring has to fit inside
+        // one: tight rings first, widening with each retry.
+        const radius = 30 + this.rng.float(0, 60) + attempt * 22;
+        const sx = x + Math.cos(angle) * radius;
+        const sy = y + Math.sin(angle) * radius;
+        if (!this.zone.map.circleCollides(sx, sy, 14)) placed = { sx, sy };
+      }
+      if (!placed) continue;
+      const { sx, sy } = placed;
       const enemy = this.addEnemy(
         {
           x: sx,
@@ -151,6 +166,31 @@ export class EnemySpawner {
     return count;
   }
 
+  /**
+   * Pre-marks spawns that were already defeated before the snapshot so a
+   * resumed sector does not regenerate them — and with them their XP, drops and
+   * kill credit. Mirrors `LootSystem.restoreCollected` and
+   * `WorldRuntime.restoreDestroyedProps`: spawn indices are positions in the
+   * generator's deterministic spawn list, so the same index always refers to
+   * the same enemy for the same seed/tier. The restored spawns count as
+   * spawned/killed because that is what happened before the checkpoint.
+   * @param {number[]} indices
+   * @returns {number} how many spawns were suppressed
+   */
+  restoreDefeated(indices) {
+    if (!Array.isArray(indices) || indices.length === 0) return 0;
+    const wanted = new Set(indices);
+    let restored = 0;
+    for (const spec of this.pending) {
+      if (spec.spawned || !wanted.has(spec.index)) continue;
+      spec.spawned = true;
+      restored += 1;
+    }
+    this.totalSpawned += restored;
+    this.killed += restored;
+    return restored;
+  }
+
   percentCleared() {
     const total = this.pending.length;
     if (total === 0) return 1;
@@ -158,14 +198,22 @@ export class EnemySpawner {
     return spawned / total;
   }
 
-  /** Boss arena wave: called when the player enters the boss room. */
+  /**
+   * Boss arena wave: called when the player enters the boss room. The wave
+   * belongs to the arena the boss is running (see BOSS_ARENAS), so the second
+   * arena opens on its own escort instead of the first one again with more
+   * health.
+   */
   triggerBossWaves() {
     if (!this.boss) return [];
     if (this.bossWavesTriggered) return [];
     this.bossWavesTriggered = true;
+    const arena = this.boss.arena ?? bossArenaFor(this.zone.tier);
+    const types = arena.waves;
+    const perType = types.length > 2 ? 3 : 4;
     const summoned = [];
-    for (const typeId of BOSS.summon.types) {
-      summoned.push(...this.summon(typeId, this.boss.x, this.boss.y, 4));
+    for (const typeId of types) {
+      summoned.push(...this.summon(typeId, this.boss.x, this.boss.y, perType));
     }
     return summoned;
   }

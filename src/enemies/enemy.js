@@ -5,7 +5,7 @@
  */
 
 import { clamp, dist2, damp } from '../core/math.js';
-import { BOSS, ENEMY_STATES, ELITE_MODIFIERS, getEnemyDef } from '../config/enemies.js';
+import { BOSS, bossArenaFor, ENEMY_STATES, ELITE_MODIFIERS, getEnemyDef } from '../config/enemies.js';
 
 let nextEnemyId = 1;
 
@@ -71,6 +71,10 @@ export class Enemy {
     this.recoverTimer = 0;
     this.staggerTimer = 0;
     this.hitFlash = 0;
+    this.lastHitAngle = 0;
+    this.lastHitTimer = 0;
+    // Set by the run when an elite ability fires; purely a render hint.
+    this.abilityFx = null;
     this.deathTimer = 0;
     this.knockbackX = 0;
     this.knockbackY = 0;
@@ -161,6 +165,13 @@ export class Enemy {
     }
     this.health -= remaining;
     this.hitFlash = 1;
+    // Which way the hit came from, so reactions (stagger lean, hit sparks) can
+    // point at the shooter instead of guessing. Pure bookkeeping: no timing or
+    // damage value depends on it.
+    if (sourceX !== null && sourceY !== null) {
+      this.lastHitAngle = Math.atan2(this.y - sourceY, this.x - sourceX);
+      this.lastHitTimer = 0.6;
+    }
     if (this.health <= 0) {
       this.health = 0;
       this.alive = false;
@@ -199,6 +210,11 @@ export class Enemy {
     this.stateTime += dt;
     this.animTime += dt;
     if (this.hitFlash > 0) this.hitFlash = Math.max(0, this.hitFlash - dt * 5);
+    if (this.lastHitTimer > 0) this.lastHitTimer = Math.max(0, this.lastHitTimer - dt);
+    if (this.abilityFx) {
+      this.abilityFx.t -= dt;
+      if (this.abilityFx.t <= 0) this.abilityFx = null;
+    }
     if (this.attackCooldown > 0) this.attackCooldown = Math.max(0, this.attackCooldown - dt);
     if (this.contactCooldown > 0) this.contactCooldown = Math.max(0, this.contactCooldown - dt);
     if (this.spawnGrace > 0) this.spawnGrace = Math.max(0, this.spawnGrace - dt);
@@ -285,21 +301,26 @@ export class BossEnemy extends Enemy {
     this.xpValue = Math.round(BOSS.xp * (difficulty.xpMul ?? 1));
     this.scoreValue = BOSS.score;
     this.aggroRange = 2000;
+    // Which arena this boss is standing in decides its phase ladder and attack
+    // kit (see BOSS_ARENAS). Arena 1 is the STOKE cycle that teaches the
+    // moveset, arena 2 the endgame MELTDOWN cycle.
+    this.arena = bossArenaFor(difficulty.tier);
+    this.phases = this.arena.phases;
     this.phaseIndex = 0;
-    this.phaseName = BOSS.phases[0].name;
+    this.phaseName = this.phases[0].name;
     this.attackTimer = 1.5;
     this.pendingAttack = null;
+    this.lastAttackKind = null;
     this.summonTimer = 9;
     this.arenaCenter = { x: spec.x, y: spec.y };
     this.arenaRadius = spec.arenaRadius ?? 420;
     this.introTimer = 2.2;
-    this.pendingPhaseChange = false;
   }
 
   get currentPhase() {
     const ratio = this.healthRatio;
-    let phase = BOSS.phases[0];
-    for (const candidate of BOSS.phases) {
+    let phase = this.phases[0];
+    for (const candidate of this.phases) {
       if (ratio <= candidate.at) phase = candidate;
     }
     return phase;
@@ -307,11 +328,10 @@ export class BossEnemy extends Enemy {
 
   updatePhase() {
     const phase = this.currentPhase;
-    const index = BOSS.phases.indexOf(phase);
+    const index = this.phases.indexOf(phase);
     if (index > this.phaseIndex) {
       this.phaseIndex = index;
       this.phaseName = phase.name;
-      this.pendingPhaseChange = true;
       return true;
     }
     return false;

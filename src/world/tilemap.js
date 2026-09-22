@@ -172,7 +172,10 @@ export class TileMap {
           if (d2 >= r * r) continue;
           if (d2 < 1e-9) {
             // Centre is inside the tile: eject along the cheapest axis that
-            // keeps the entity inside the map, preferring the map interior.
+            // keeps the entity inside the map *and* actually leaves it clear,
+            // preferring the map interior. Testing candidates in cost order
+            // matters because the cheapest edge can still be inside a wall
+            // cluster, which would leave the entity stuck forever.
             const candidates = [
               { axis: 'x', value: rx - r, cost: Math.abs(entity.x - (rx - r)) },
               { axis: 'x', value: rx + this.tileSize + r, cost: Math.abs(entity.x - (rx + this.tileSize + r)) },
@@ -184,10 +187,17 @@ export class TileMap {
               const py = c.axis === 'y' ? c.value : entity.y;
               return px >= 0 && py >= 0 && px <= this.worldWidth && py <= this.worldHeight;
             });
-            const pool = inBounds.length > 0 ? inBounds : candidates;
+            const pool = (inBounds.length > 0 ? inBounds : candidates)
+              .slice()
+              .sort((a, b) => a.cost - b.cost);
             let best = pool[0];
             for (const candidate of pool) {
-              if (candidate.cost < best.cost) best = candidate;
+              const px = candidate.axis === 'x' ? candidate.value : entity.x;
+              const py = candidate.axis === 'y' ? candidate.value : entity.y;
+              if (!this.circleCollides(px, py, r)) {
+                best = candidate;
+                break;
+              }
             }
             if (best.axis === 'x') entity.x = best.value;
             else entity.y = best.value;

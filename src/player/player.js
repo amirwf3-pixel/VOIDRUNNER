@@ -7,9 +7,72 @@
  */
 
 import { clamp, damp, dist2, rotateToward, TAU } from '../core/math.js';
-import { ARMOR_REDUCTION_CAP, ARMOR_REDUCTION_PER_POINT, PLAYER_BASE } from '../config/balance.js';
+import { ARMOR_REDUCTION_CAP, ARMOR_REDUCTION_PER_POINT, CONSUMABLES, PLAYER_BASE, RESOURCE_DEFS } from '../config/balance.js';
 import { AmmoPool, WeaponInstance, STARTING_RESERVE } from '../weapons/weapon.js';
 import { getWeaponDef } from '../config/weapons.js';
+
+/** Upper bound for a saved consumable stack; well above any reachable in-run value. */
+const CONSUMABLE_STOCK_CAP = 999;
+
+/**
+ * Counters the run result reports are whole numbers: anything non-finite,
+ * negative or unparseable becomes zero, so a malformed snapshot cannot put NaN
+ * into the results screen or the account records derived from them.
+ */
+function statCount(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+/**
+ * Normalises a saved consumable stock against the live `CONSUMABLES` table.
+ *
+ * Unknown keys are dropped, and counts are floored to whole units and clamped
+ * to [0, CONSUMABLE_STOCK_CAP] so a malformed save cannot create negative,
+ * fractional or non-finite stock. Missing/invalid entries inside a payload that
+ * does contain consumable data become 0 (the player simply carries none).
+ *
+ * @returns {{medkit:number, armorplate:number, stim:number}|null} `null` when
+ *   the payload holds no recognisable consumable data at all, which lets
+ *   callers fall back to the pre-consumable-save behaviour.
+ */
+function normalizeConsumables(state) {
+  if (!state || typeof state !== 'object') return null;
+  const out = {};
+  let recognised = 0;
+  for (const key of Object.keys(CONSUMABLES)) {
+    const value = state[key];
+    if (Number.isFinite(value)) recognised += 1;
+    out[key] = Number.isFinite(value) ? clamp(Math.floor(value), 0, CONSUMABLE_STOCK_CAP) : 0;
+  }
+  return recognised > 0 ? out : null;
+}
+
+/**
+ * Upper bound for a saved loot stack; mirrors `MAX_LOOT_STACK` in the save
+ * validator. Well above any amount reachable in a run.
+ */
+const LOOT_STACK_CAP = 1e6;
+
+/**
+ * Normalises a saved loot bag against the live `RESOURCE_DEFS` table.
+ *
+ * `SaveSystem` already sanitises this, but `Run` can also be built from an
+ * in-memory snapshot that never went through validation, and the bag feeds
+ * `lootValue()` -> `result.lootValue`/`result.cores` -> the settled account. So
+ * the same rule is re-applied here: known resources only, finite numbers only,
+ * rounded and clamped to 0..`LOOT_STACK_CAP`. Unusable values contribute
+ * nothing, and valid loot is kept exactly as saved.
+ */
+function normalizeLoot(state) {
+  const source = state && typeof state === 'object' && !Array.isArray(state) ? state : {};
+  const out = {};
+  for (const key of Object.keys(RESOURCE_DEFS)) {
+    const value = Number.isFinite(source[key]) ? clamp(Math.round(source[key]), 0, LOOT_STACK_CAP) : 0;
+    out[key] = value;
+  }
+  return out;
+}
 
 export const PLAYER_STATE = {
   ACTIVE: 'active',
@@ -385,17 +448,41 @@ export class Player {
     this.aimAngle = rotateToward(this.aimAngle, targetAngle, maxStep);
   }
 
+  /**
+   * Counters the run result reports (shots, dashes). They live on the player,
+   * but they are run totals, so they are carried through every rebuild of the
+   * player instead of restarting at zero.
+   */
+  serializeStats() {
+    return {
+      shotsFired: this.stats.shotsFired,
+      shotsHit: this.stats.shotsHit,
+      dashes: this.stats.dashes,
+    };
+  }
+
   serialize() {
     return {
       loot: { ...this.loot },
       weapons: this.weapons.map((w) => w.serialize()),
+      weaponIndex: this.weaponIndex,
       reserve: this.ammo.serialize(),
+      consumables: { ...this.consumables },
       health: this.health,
       armor: this.armor,
+      stats: this.serializeStats(),
     };
   }
 
-  static restore(data, spawn, bonuses) {
+  /**
+   * @param {Object} data serialized player payload
+   * @param {{x:number,y:number}} spawn
+   * @param {Object} bonuses result of Progression.computeRunBonuses()
+   * @param {(player: Player) => void} [beforeVitals] run-level hook invoked once
+   *   the player exists but before the saved health/armor are applied, so the
+   *   caps those values are clamped against already include earned run perks
+   */
+  static restore(data, spawn, bonuses, beforeVitals = null) {
     const player = new Player(spawn, bonuses);
     if (!data) return player;
     const weapons = Array.isArray(data.weapons)
@@ -403,8 +490,10 @@ export class Player {
       : [];
     if (weapons.length > 0) {
       player.weapons = weapons;
-      player.weaponIndex = 0;
-      player.weapons[0].raise();
+      // Clamped here as well as in the save validator: `Run` can be built from
+      // an in-memory snapshot that never went through validation.
+      player.weaponIndex = clamp(Math.round(data.weaponIndex ?? 0), 0, weapons.length - 1);
+      player.weapons[player.weaponIndex].raise();
     } else {
       player.setLoadout(['pistol'], bonuses);
     }
@@ -415,11 +504,34 @@ export class Player {
       }
     }
     player.ammo = pool;
-    player.loot = { scrap: 0, cores: 0, cells: 0, datashard: 0, intel: 0, ...(data.loot ?? {}) };
+    player.loot = normalizeLoot(data.loot);
+
+    // Perks that raise `maxHealth`/`maxArmor` are replayed before the saved
+    // vitals are clamped, otherwise a legitimately saved value would be shaved
+    // down to the pre-perk cap.
+    if (beforeVitals) beforeVitals(player);
+
     player.health = clamp(data.health ?? player.maxHealth, 1, player.maxHealth);
     player.armor = clamp(data.armor ?? player.maxArmor, 0, Math.max(player.maxArmor, 50));
-    player.medkits = 1 + (bonuses.medkitsAdd ?? 0);
-    player.consumables.medkit = player.medkits;
+
+    // Run totals the player owns (see `serializeStats`). Older snapshots carry
+    // none of them, which simply resumes with zeroed counters.
+    const stats = data.stats && typeof data.stats === 'object' ? data.stats : {};
+    player.stats.shotsFired = statCount(stats.shotsFired);
+    player.stats.shotsHit = statCount(stats.shotsHit);
+    player.stats.dashes = statCount(stats.dashes);
+
+    // Consumable stock is carried state: restore the exact saved counts. Only
+    // saves predating consumable persistence fall back to the older resume
+    // default (one bonus-adjusted medkit, no plates or stims).
+    const consumables = normalizeConsumables(data.consumables);
+    if (consumables) {
+      player.consumables = consumables;
+      player.medkits = consumables.medkit;
+    } else {
+      player.medkits = 1 + (bonuses.medkitsAdd ?? 0);
+      player.consumables.medkit = player.medkits;
+    }
     return player;
   }
 }

@@ -34,7 +34,16 @@ export const PALETTE = {
   boss: '#ff5c33',
 
   ui: '#dce6f2',
-  uiDim: '#7d8ea3',
+  uiStrong: '#f2f7ff',
+  uiDim: '#8b9cb2',
+  /**
+   * Tertiary text (hints, metadata). Measured against the panel surface:
+   * 4.24:1 — readable at small sizes, still clearly below body text.
+   */
+  uiGhost: '#6b7d94',
+  /** Disabled controls: legible but unmistakably inactive (3.01:1). */
+  uiDisabled: '#55657c',
+  /** Non-text fills only (inactive pips, map blocks) — never used for copy. */
   uiFaint: '#3a475a',
   uiAccent: '#7fe6ff',
   uiAccentSoft: 'rgba(127, 230, 255, 0.14)',
@@ -44,6 +53,10 @@ export const PALETTE = {
   uiPanel: 'rgba(10, 15, 22, 0.92)',
   uiPanelSolid: '#0b1119',
   uiBorder: 'rgba(127, 230, 255, 0.22)',
+  /** Meter tracks and inner surfaces. */
+  uiTrack: 'rgba(4, 7, 11, 0.92)',
+  uiTrackLight: 'rgba(255, 255, 255, 0.06)',
+  uiShadow: 'rgba(0, 0, 0, 0.5)',
 
   lootCommon: '#9fb3c8',
   lootUncommon: '#6fe3c4',

@@ -13,7 +13,9 @@ import {
   LOOTABLE_WEAPONS,
   WEAPON_TIER_NAMES,
 } from '../config/weapons.js';
-import { CONSUMABLES, LOOT_TABLE, RARITY_COLORS, RARITY_ORDER, RESOURCE_DEFS } from '../config/balance.js';
+import {
+  CONSUMABLES, LOOT_TABLE, RARITY_COLORS, RARITY_ORDER, RESOURCE_DEFS, weaponTierWeights,
+} from '../config/balance.js';
 
 const AMMO_TO_TYPE = {
   ammo_light: AMMO_TYPES.LIGHT,
@@ -74,6 +76,8 @@ export class Drop {
         return `${WEAPON_TIER_NAMES[this.tier]} Weapon`;
       case DROP_KIND.CHIP:
         return 'Upgrade Chip';
+      case DROP_KIND.OBJECTIVE:
+        return 'Data Shard';
       default:
         return this.key;
     }
@@ -107,6 +111,25 @@ export function rollLoot(rng, ctx) {
   return { entry: picked, amount };
 }
 
+/**
+ * Rolls a weapon drop's tier for a sector, shifted upward by `rarityBoost`.
+ * Consumes exactly one RNG draw whatever the weights are, so loot streams stay
+ * aligned with the seed.
+ */
+function pickWeaponTier(rng, sectorTier, rarityBoost) {
+  const base = weaponTierWeights(sectorTier);
+  if (!rarityBoost) return rng.weighted(base).tier;
+  const shifted = base.map((entry) => ({
+    ...entry,
+    weight: entry.tier === 3
+      ? entry.weight * (1 + rarityBoost * 0.6)
+      : entry.tier === 1
+        ? entry.weight * Math.max(0.35, 1 - rarityBoost * 0.2)
+        : entry.weight,
+  }));
+  return rng.weighted(shifted).tier;
+}
+
 /** Converts a rolled entry into a Drop instance. */
 export function entryToDrop(entry, amount, x, y, rng, spec = {}) {
   if (entry.id in AMMO_TO_TYPE) {
@@ -122,12 +145,12 @@ export function entryToDrop(entry, amount, x, y, rng, spec = {}) {
   }
   if (entry.id === 'weapon') {
     const weaponId = spec.weaponId ?? rng.pick(LOOTABLE_WEAPONS);
-    const tier = spec.weaponTier
-      ?? rng.weighted([
-        { tier: 1, weight: 62 },
-        { tier: 2, weight: 28 },
-        { tier: 3, weight: 10 },
-      ]).tier;
+    // Weapon tier is the in-run refinement axis, so the odds follow the sector:
+    // a fixed roll kept returning tier-1 duplicates once the player was armed
+    // with better. `sectorTier` is optional so direct callers keep the tier-1
+    // odds; a `rarityBoost` (elites, bosses, high-quality caches) pushes the
+    // roll further up, mirroring how rollLoot already treats rare entries.
+    const tier = spec.weaponTier ?? pickWeaponTier(rng, spec.sectorTier ?? 1, spec.rarityBoost ?? 0);
     const rarity = tier === 3 ? 'legendary' : tier === 2 ? 'epic' : 'rare';
     return new Drop({
       kind: DROP_KIND.WEAPON,
@@ -167,6 +190,8 @@ export class LootSystem {
     this.drops = [];
     this.nextId = 1;
     this.totalPicked = 0;
+    /** Ids of drops taken this sector; kept so resume does not respawn them. */
+    this.collectedIds = new Set();
     this.onPickup = null;
     this.onError = null;
     this._seedZoneLoot();
@@ -189,7 +214,7 @@ export class LootSystem {
           spawn.x + Math.cos(jitterAngle) * jitterRadius,
           spawn.y + Math.sin(jitterAngle) * jitterRadius,
           this.rng,
-          { id: this.nextId++, sourceRoomId: spawn.roomId },
+          { id: this.nextId++, sourceRoomId: spawn.roomId, sectorTier: this.zone.tier, rarityBoost: spawn.rarityBoost ?? 0 },
         );
         this.drops.push(drop);
       }
@@ -216,6 +241,8 @@ export class LootSystem {
         vx: Math.cos(angle) * 60,
         vy: Math.sin(angle) * 60,
         sourceRoomId: -1,
+        sectorTier: this.zone.tier,
+        rarityBoost: boost,
       });
       this.drops.push(drop);
       created.push(drop);
@@ -290,8 +317,39 @@ export class LootSystem {
     if (!result) return false;
     drop.active = false;
     this.totalPicked += 1;
+    // Remember what was taken: drop ids are assigned in deterministic seeding
+    // order, so this is the identity needed to keep the drop gone after resume.
+    this.collectedIds.add(drop.id);
     if (this.onPickup) this.onPickup(drop, result);
     return true;
+  }
+
+  /**
+   * Re-applies a saved set of already-collected drop ids to a freshly seeded
+   * sector. Seeding is deterministic (same ids for the same seed/tier), so a
+   * collected id still refers to the same physical drop; those drops are
+   * deactivated instead of respawning. Ids with no matching drop — drops that
+   * were created at runtime before the snapshot — are recorded anyway so they
+   * survive a second resume.
+   * @param {number[]} ids
+   * @returns {number} how many seeded drops were removed
+   */
+  restoreCollected(ids) {
+    if (!Array.isArray(ids) || ids.length === 0) return 0;
+    const wanted = new Set(ids);
+    let removed = 0;
+    for (const drop of this.drops) {
+      if (!drop.active || !wanted.has(drop.id)) continue;
+      drop.active = false;
+      removed += 1;
+    }
+    for (const id of ids) this.collectedIds.add(id);
+    return removed;
+  }
+
+  /** Collected drop ids in a stable order, for the resumable-run snapshot. */
+  collectedIdList() {
+    return Array.from(this.collectedIds).sort((a, b) => a - b);
   }
 
   /** Pure-ish resolution of a pickup, returns a descriptor or null when blocked. */
@@ -327,11 +385,21 @@ export class LootSystem {
         };
       }
       case DROP_KIND.CHIP: {
-        // Upgrade chips are banked XP immediately - they are too valuable to
-        // risk carrying, which makes them a real decision point.
+        // Upgrade chips are spent the moment they are picked up: the run banks
+        // the XP in `notifyPickup` (it owns levels and perks), and the cells are
+        // the chip's salvage. Nothing is carried, so the drop is immediate value.
         const xp = 45 * this.zone.tier;
         player.addLoot('cells', drop.amount * 2);
-        return { type: 'chip', key: 'upgrade_chip', amount: drop.amount, xp, rarity: 'epic', label: 'Upgrade chip (+XP on extraction)' };
+        return { type: 'chip', key: 'upgrade_chip', amount: drop.amount, xp, rarity: 'epic', label: `Upgrade chip (+${xp} XP)` };
+      }
+      case DROP_KIND.OBJECTIVE: {
+        // Objective shards are not loot: they carry their progress through
+        // `objectiveId`, which the run reports from the pickup callback
+        // (`run.loot.onPickup` -> `objectives.onMarkerCollected`). Returning a
+        // result here is what lets them deactivate and be recorded in
+        // `collectedIds` like any other seeded drop, so a resumed sector keeps
+        // the shards the player already recovered.
+        return { type: 'objective', key: drop.key, amount: drop.amount, rarity: drop.rarity, label: drop.label };
       }
       default:
         return null;
@@ -340,6 +408,9 @@ export class LootSystem {
 
   /** Uses a consumable, returning the effect descriptor or null when unavailable. */
   useConsumable(player, key) {
+    // Validate the key first: an unknown consumable is a programming error and
+    // must not be swallowed by the "out of stock" path.
+    if (!CONSUMABLES[key]) throw new Error(`Unknown consumable "${key}"`);
     const available = player.consumables[key] ?? 0;
     if (available <= 0) return null;
     if (key === 'medkit') {

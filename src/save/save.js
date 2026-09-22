@@ -10,7 +10,10 @@
  * makes the whole thing testable in Node with a memory stub.
  */
 
-import { AUDIO_DEFAULTS, GAMEPLAY_DEFAULTS, VIDEO_DEFAULTS } from '../config/balance.js';
+import { AUDIO_DEFAULTS, GAMEPLAY_DEFAULTS, MAP_GEN_DEFAULTS, RESOURCE_DEFS, VIDEO_DEFAULTS } from '../config/balance.js';
+// Progression bounds are owned by the run so the validator can never drift from
+// the level ceiling or the perk table it is sanitising against.
+import { MAX_RUN_LEVEL, RUN_PERKS } from '../game/run.js';
 
 export const SAVE_KEY = 'voidrunner.profile.v1';
 export const SAVE_VERSION = 3;
@@ -169,6 +172,20 @@ function num(value, fallback, min = -Infinity, max = Infinity) {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * Like `num`, but tolerant of numeric strings. Used for resumable-run fields:
+ * older builds stored `tier`/`elapsed` as strings, and a run that cannot be
+ * resumed costs the player the whole sector. Anything non-numeric still falls
+ * back, so garbage is never accepted.
+ */
+function numLoose(value, fallback, min = -Infinity, max = Infinity) {
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.max(min, Math.min(max, parsed));
+  }
+  return num(value, fallback, min, max);
+}
+
 function bool(value, fallback) {
   return typeof value === 'boolean' ? value : fallback;
 }
@@ -243,7 +260,13 @@ export function sanitizeProfile(input) {
   base.settings.gameplay.cursorLock = bool(gameplay.cursorLock, GAMEPLAY_DEFAULTS.cursorLock);
   base.settings.gameplay.aimAssist = num(gameplay.aimAssist, GAMEPLAY_DEFAULTS.aimAssist, 0, 1);
 
-  if (input.run && typeof input.run === 'object') {
+  // A stored run is resumable only when it is a real payload. `null` (what
+  // `defaultProfile` writes and what settlement leaves behind) and a missing
+  // field (profiles written before runs were persisted) are the legitimate
+  // "no run in progress" states and stay silent. Every other unusable value is
+  // corrupted data, reported through the existing load warning exactly like
+  // object-shaped garbage always was - a stored run is never dropped quietly.
+  if (input.run !== null && input.run !== undefined) {
     const validated = validateResumableRun(input.run);
     if (validated) base.run = validated;
     else warnings.push('Stored run could not be resumed and was discarded.');
@@ -258,6 +281,252 @@ export function sanitizeProfile(input) {
   return { profile: base, warnings };
 }
 
+/** Upper bound on persisted collected-drop ids; far above one sector's drop count. */
+const MAX_COLLECTED_DROP_IDS = 2000;
+/** Upper bound on persisted destroyed-prop ids; a sector only has a handful. */
+const MAX_DESTROYED_PROP_IDS = 512;
+/** Upper bound on persisted defeated-spawn ids; a sector has well under 100. */
+const MAX_DEFEATED_SPAWN_IDS = 512;
+
+/**
+ * Shared validation for sector-scoped id sets (collected drops, destroyed
+ * objective props). Ids only make sense inside the sector that produced them,
+ * so the tier is stored alongside them and a payload without a usable tier is
+ * discarded entirely. Malformed entries are dropped, duplicates collapsed and
+ * the list capped, so a hostile or corrupt payload can never grow without bound
+ * or hand generation a value it cannot use.
+ * @returns {{tier:number, ids:number[]}|undefined}
+ */
+function sanitizeTierScopedIds(state, cap) {
+  if (!state || typeof state !== 'object' || !Array.isArray(state.ids)) return undefined;
+  const tier = Math.round(numLoose(state.tier, 0, 0, 99));
+  if (tier <= 0) return undefined;
+  const seen = new Set();
+  const ids = [];
+  for (const raw of state.ids) {
+    if (!Number.isFinite(raw)) continue;
+    const id = Math.trunc(raw);
+    if (id < 0 || seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+    if (ids.length >= cap) break;
+  }
+  return { tier, ids };
+}
+
+/**
+ * Ids of ground drops already collected in the current sector (every sector
+ * restarts the drop id sequence at 1).
+ * @returns {{tier:number, ids:number[]}|undefined}
+ */
+function sanitizeCollectedDrops(state) {
+  return sanitizeTierScopedIds(state, MAX_COLLECTED_DROP_IDS);
+}
+
+/**
+ * Ids of objective props destroyed in the current sector. Prop ids are array
+ * positions, so every sector numbers its props from zero and the tier scoping
+ * matters just as much here: an id from sector 1 must never knock out a prop in
+ * sector 2. Restoration additionally re-checks that a prop both matches the id
+ * and participates in an objective.
+ * @returns {{tier:number, ids:number[]}|undefined}
+ */
+function sanitizeDestroyedProps(state) {
+  return sanitizeTierScopedIds(state, MAX_DESTROYED_PROP_IDS);
+}
+
+/**
+ * Spawn indices of enemies defeated in the current sector. Spawn indices are
+ * positions in the generator's deterministic spawn list, so they carry the same
+ * tier scoping as drop and prop ids: an index from sector 1 must never suppress
+ * an enemy in sector 2. Restoration re-checks the tier before applying them.
+ * @returns {{tier:number, ids:number[]}|undefined}
+ */
+function sanitizeDefeatedSpawns(state) {
+  return sanitizeTierScopedIds(state, MAX_DEFEATED_SPAWN_IDS);
+}
+
+/**
+ * Boss arena intro wave. The wave is summoned once per sector, so its trigger
+ * is sector-scoped consumed content like `defeatedSpawns`: an untriggered (or
+ * missing) record simply leaves the arena as a fresh sector would.
+ * @returns {{tier:number, triggered:boolean}|undefined}
+ */
+function sanitizeBossWaves(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return undefined;
+  const tier = Math.round(numLoose(state.tier, 0, 0, 99));
+  if (tier <= 0) return undefined;
+  return { tier, triggered: bool(state.triggered, false) };
+}
+
+/**
+ * Objective progress is part of a resumable run: completing the zone's
+ * objectives is what unlocks extraction, so dropping it on load would send the
+ * player back to an un-extractable sector. Only the shape the runtime
+ * understands is kept, so a malformed save cannot inject arbitrary state.
+ * The state is tagged with the sector it was recorded in (objective ids are
+ * shared by every tier), and untiered states from older builds stay accepted.
+ * @returns {{tier?:number, objectives: Array<{id:string, progress:number, complete:boolean}>}|null}
+ */
+function sanitizeObjectiveState(state) {
+  if (!state || typeof state !== 'object' || !Array.isArray(state.objectives)) return null;
+  const objectives = [];
+  for (const entry of state.objectives) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (typeof entry.id !== 'string' || entry.id.length === 0) continue;
+    objectives.push({
+      id: entry.id.slice(0, 64),
+      progress: Math.round(numLoose(entry.progress, 0, 0, 1e9)),
+      complete: bool(entry.complete, false),
+    });
+  }
+  if (objectives.length === 0) return null;
+  // Sector-tagged states are only applied to the tier they name
+  // (`ObjectiveRuntime.restore`); legacy states carry no tier and stay accepted.
+  if (!Number.isFinite(state.tier)) return { objectives };
+  return { tier: Math.round(numLoose(state.tier, 1, 1, 99)), objectives };
+}
+
+/**
+ * Normalises saved weapons. Entries accept both the legacy bare-id form
+ * (`'smg'`) and the current object form (`{id, tier, ammo}`); both come back as
+ * `{id}` plus `tier`/`ammo` only when those are finite numbers. A missing or
+ * malformed `ammo` is therefore left out and the deserializer falls back to a
+ * full magazine — exactly how runs saved before these fields existed behave.
+ * Duplicate ids are collapsed because the live game never holds two instances
+ * of the same weapon.
+ * @returns {Array<{id:string, tier?:number, ammo?:number}>} never empty
+ */
+function sanitizeWeapons(list) {
+  if (!Array.isArray(list)) return [{ id: 'pistol' }];
+  const out = [];
+  const seen = new Set();
+  for (const entry of list) {
+    const spec = typeof entry === 'string' ? { id: entry } : entry;
+    if (!spec || typeof spec !== 'object') continue;
+    const id = typeof spec.id === 'string' ? spec.id.slice(0, 64) : '';
+    if (id.length === 0 || seen.has(id)) continue;
+    seen.add(id);
+    const weapon = { id };
+    if (Number.isFinite(spec.tier)) weapon.tier = Math.round(clampNumber(spec.tier, 1, 3));
+    if (Number.isFinite(spec.ammo)) weapon.ammo = Math.round(clampNumber(spec.ammo, 0, 1e6));
+    out.push(weapon);
+  }
+  return out.length > 0 ? out : [{ id: 'pistol' }];
+}
+
+/**
+ * Run statistics are counters: whole numbers, never negative, never non-finite.
+ * Anything else - strings, NaN, Infinity, negative noise - becomes 0, which is
+ * the same default a save written before the counter existed resumes with.
+ */
+function statCount(value) {
+  return Math.round(numLoose(value, 0, 0, 1e12));
+}
+
+/** Run-owned statistics reported by the run result. */
+function sanitizeRunStats(state) {
+  const stats = state && typeof state === 'object' ? state : {};
+  return {
+    damageDealt: statCount(stats.damageDealt),
+    damageTaken: statCount(stats.damageTaken),
+    elitesKilled: statCount(stats.elitesKilled),
+    bossKills: statCount(stats.bossKills),
+    sectorsCleared: statCount(stats.sectorsCleared),
+    lootCollected: statCount(stats.lootCollected),
+  };
+}
+
+/** Player-owned counters reported by the same result. */
+function sanitizePlayerStats(state) {
+  const stats = state && typeof state === 'object' ? state : {};
+  return {
+    shotsFired: statCount(stats.shotsFired),
+    shotsHit: statCount(stats.shotsHit),
+    dashes: statCount(stats.dashes),
+  };
+}
+
+/**
+ * Ranges for the generation parameters a resumable run may carry.
+ *
+ * The generator reads exactly the `MAP_GEN_DEFAULTS` keys, so only those are
+ * kept; these ranges are the values it can use meaningfully (world dimensions
+ * are clamped to 2200..5200px internally, `roomAttempts` has a floor of 40
+ * during relaxation, and the rest are probabilities or tile-scale pixel sizes).
+ * Keys without an entry here are simply not persisted.
+ */
+const GEN_PARAM_BOUNDS = {
+  width: [1200, 6000],
+  height: [1200, 6000],
+  roomAttempts: [40, 400],
+  minRoomSize: [64, 320],
+  maxRoomSize: [120, 640],
+  largeRoomChance: [0, 1],
+  corridorWidth: [32, 256],
+  wallThickness: [8, 64],
+  obstacleDensity: [0, 1],
+};
+
+/**
+ * Sanitises the generation input carried by a resumable run.
+ *
+ * Unknown keys are dropped, values must already be finite numbers (numeric
+ * strings, NaN, Infinity, arrays and nested objects are ignored), and each
+ * value is clamped to `GEN_PARAM_BOUNDS`. A missing or malformed payload
+ * becomes `{}`, which regenerates from `MAP_GEN_DEFAULTS` - exactly how runs
+ * saved before this field existed behave.
+ */
+function sanitizeGenParams(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return {};
+  const out = {};
+  for (const key of Object.keys(MAP_GEN_DEFAULTS)) {
+    const bounds = GEN_PARAM_BOUNDS[key];
+    if (!bounds) continue;
+    const value = num(state[key], null, bounds[0], bounds[1]);
+    if (value !== null) out[key] = value;
+  }
+  return out;
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Hard ceiling for a single carried resource stack. Run loot enters the bag in
+ * single or double digit amounts, so a stack anywhere near this can only come
+ * from a tampered payload.
+ */
+const MAX_LOOT_STACK = 1e6;
+
+/**
+ * Sanitises the carried loot bag.
+ *
+ * Only resources declared in `RESOURCE_DEFS` are kept and values must already
+ * be finite numbers: strings, booleans, arrays, objects, NaN and Infinity are
+ * dropped. Quantities are rounded (matching `Player.addLoot`, which is the only
+ * way loot enters the bag during play) and clamped to 0..`MAX_LOOT_STACK`, so a
+ * negative stack becomes 0 instead of banking a negative balance. A missing or
+ * malformed bag becomes `{}`, which resumes exactly like a run saved before
+ * loot was persisted.
+ *
+ * This is the load-bearing guard for the account: `lootValue()` feeds
+ * `result.lootValue`/`result.cores`, and `result.cores` is added straight to
+ * `account.cores`, so a non-finite value used to erase the banked balance on
+ * the next load. `Player.restore` re-applies the same rule for snapshots that
+ * never went through this validator.
+ */
+function sanitizeLoot(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return {};
+  const out = {};
+  for (const key of Object.keys(RESOURCE_DEFS)) {
+    const value = num(state[key], null, 0, MAX_LOOT_STACK);
+    if (value !== null) out[key] = Math.round(value);
+  }
+  return out;
+}
+
 /**
  * A resumable run only needs the seed, sector, elapsed time and carried loot -
  * the zone itself is regenerated deterministically from the seed, which keeps
@@ -266,25 +535,53 @@ export function sanitizeProfile(input) {
 export function validateResumableRun(run) {
   if (!run || typeof run !== 'object') return null;
   if (typeof run.seed !== 'string' || run.seed.length === 0) return null;
-  const tier = Math.round(num(run.tier, 1, 1, 99));
-  const elapsed = num(run.elapsed, 0, 0, 1e6);
-  const loot = run.loot && typeof run.loot === 'object' ? { ...run.loot } : {};
-  const weapons = Array.isArray(run.weapons)
-    ? run.weapons.filter((w) => typeof w === 'string' && w.length > 0)
-    : ['pistol'];
+  const tier = Math.round(numLoose(run.tier, 1, 1, 99));
+  const elapsed = numLoose(run.elapsed, 0, 0, 1e6);
+  const loot = sanitizeLoot(run.loot);
+  const weapons = sanitizeWeapons(run.weapons);
+  const weaponIndex = Math.round(num(run.weaponIndex, 0, 0, weapons.length - 1));
   const reserve = run.reserve && typeof run.reserve === 'object' ? { ...run.reserve } : {};
+  // Kept as a plain copy for the same reason as `reserve`: the owning module
+  // (`Player`) normalises counts against the live CONSUMABLES table on restore.
+  const consumables = run.consumables && typeof run.consumables === 'object' ? { ...run.consumables } : undefined;
+  // In-run progression. Missing fields fall back to a fresh level-1 run, which
+  // is exactly how saves written before progression was persisted behave.
+  const level = Math.round(numLoose(run.level, 1, 1, MAX_RUN_LEVEL));
+  const xp = numLoose(run.xp, 0, 0, 1e9);
+  const xpEarnedTotal = numLoose(run.xpEarnedTotal, 0, 0, 1e9);
+  const perkIndex = Math.round(numLoose(run.perkIndex, 0, 0, RUN_PERKS.length));
   return {
     seed: run.seed.slice(0, 40),
     tier,
     elapsed,
     loot,
-    weapons: weapons.length > 0 ? weapons : ['pistol'],
+    weapons,
+    weaponIndex,
     reserve,
-    health: num(run.health, 100, 1, 1e6),
-    armor: num(run.armor, 0, 0, 1e6),
-    sectorTime: num(run.sectorTime, 0, 0, 1e6),
-    kills: Math.round(num(run.kills, 0, 0, 1e9)),
-    objectivesCompleted: Math.round(num(run.objectivesCompleted, 0, 0, 1e9)),
-    startedAt: num(run.startedAt, Date.now(), 0, 1e15),
+    consumables,
+    health: numLoose(run.health, 100, 1, 1e6),
+    armor: numLoose(run.armor, 0, 0, 1e6),
+    // `sectorTime` and `startedAt` are deliberately absent: every build up to
+    // v3 wrote them, yet nothing (menu, results, settlement) ever read them
+    // back. This function returns a whitelist, so legacy payloads that still
+    // carry them are accepted, ignored and dropped on the next save.
+    kills: Math.round(numLoose(run.kills, 0, 0, 1e9)),
+    objectivesCompleted: Math.round(numLoose(run.objectivesCompleted, 0, 0, 1e9)),
+    // Run statistics. Missing bags (saves written before they were persisted)
+    // resume as zeroed counters, exactly like a fresh run.
+    stats: sanitizeRunStats(run.stats),
+    playerStats: sanitizePlayerStats(run.playerStats),
+    // Generation input. Absent in saves written before it was persisted, which
+    // sanitises to `{}` and regenerates exactly like those builds did.
+    genParams: sanitizeGenParams(run.genParams),
+    level,
+    xp,
+    xpEarnedTotal,
+    perkIndex,
+    objectiveState: sanitizeObjectiveState(run.objectiveState),
+    collectedDrops: sanitizeCollectedDrops(run.collectedDrops),
+    destroyedProps: sanitizeDestroyedProps(run.destroyedProps),
+    defeatedSpawns: sanitizeDefeatedSpawns(run.defeatedSpawns),
+    bossWaves: sanitizeBossWaves(run.bossWaves),
   };
 }
