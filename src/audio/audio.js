@@ -34,10 +34,21 @@ export const SFX = {
   RELOAD_FINISH: 'weapon.reload.finish',
   DRYFIRE: 'weapon.dryfire',
   SWAP: 'weapon.swap',
+  SWAP_READY: 'weapon.swap.ready',
+  SWAP_FAIL: 'weapon.swap.fail',
+  WEAPON_TAIL: 'weapon.tail',
   HIT_FLESH: 'hit.flesh',
   HIT_ARMOR: 'hit.armor',
   HIT_CRIT: 'hit.crit',
   HIT_KILL: 'hit.kill',
+  SHIELD_HIT: 'shield.hit',
+  SHIELD_BREAK: 'shield.break',
+  ENEMY_STAGGER: 'enemy.stagger',
+  DEATH_LIGHT: 'enemy.death.light',
+  DEATH_HEAVY: 'enemy.death.heavy',
+  ELITE_SHIELD: 'elite.shield',
+  ELITE_SUMMON: 'elite.summon',
+  ELITE_BURST: 'elite.burst',
   PLAYER_DAMAGE: 'player.damage',
   PLAYER_DEATH: 'player.death',
   PLAYER_DASH: 'player.dash',
@@ -60,9 +71,13 @@ export const SFX = {
   BOSS_SPAWN: 'boss.spawn',
   BOSS_PHASE: 'boss.phase',
   BOSS_DEATH: 'boss.death',
+  BOSS_WAVE: 'boss.wave',
   LOOT_PICKUP: 'loot.pickup',
   LOOT_RARE: 'loot.rare',
+  LOOT_UPGRADE: 'loot.upgrade',
   LEVEL_UP: 'levelup',
+  PLAYER_LOW_HEALTH: 'player.lowhealth',
+  SECTOR_START: 'sector.start',
   EXPLOSION: 'combat.explosion',
   MELEE: 'combat.melee',
 };
@@ -94,11 +109,32 @@ const RECIPES = {
   [SFX.RELOAD_START]: { type: 'click', dur: 0.09, f0: 320, f1: 160, gain: 0.34 },
   [SFX.RELOAD_FINISH]: { type: 'click', dur: 0.12, f0: 210, f1: 420, gain: 0.4 },
   [SFX.DRYFIRE]: { type: 'click', dur: 0.06, f0: 900, f1: 500, gain: 0.24 },
-  [SFX.SWAP]: { type: 'click', dur: 0.1, f0: 520, f1: 780, gain: 0.28 },
+  // A swap is two mechanical events, not one: the weapon goes away and the next
+  // one comes up. `SWAP` is the heavy holster clack; `SWAP_READY` is the bolt
+  // tick that lands exactly when the raise animation finishes, so the player can
+  // hear when the new weapon is actually usable.
+  [SFX.SWAP]: { type: 'click', dur: 0.14, f0: 300, f1: 86, gain: 0.34, minGap: 0.05 },
+  [SFX.SWAP_READY]: { type: 'click', dur: 0.08, f0: 700, f1: 1280, gain: 0.3, minGap: 0.05 },
+  [SFX.SWAP_FAIL]: { type: 'click', dur: 0.06, f0: 240, f1: 180, gain: 0.18, minGap: 0.12 },
+  // Low-end body for the heavy weapon classes, layered under their muzzle report.
+  [SFX.WEAPON_TAIL]: { type: 'tone', dur: 0.24, f0: 150, f1: 44, gain: 0.34, wave: 'triangle', minGap: 0.05 },
   [SFX.HIT_FLESH]: { type: 'noise', dur: 0.1, f0: 900, f1: 200, gain: 0.36, filter: 'lowpass' },
   [SFX.HIT_ARMOR]: { type: 'noise', dur: 0.09, f0: 2600, f1: 1400, gain: 0.34, filter: 'bandpass', q: 3 },
   [SFX.HIT_CRIT]: { type: 'tone', dur: 0.16, f0: 1250, f1: 1900, gain: 0.34, wave: 'square' },
   [SFX.HIT_KILL]: { type: 'tone', dur: 0.24, f0: 340, f1: 70, gain: 0.4, wave: 'sawtooth' },
+  // Energy shields are tonal and layered, plates are noise: two absorb channels
+  // that used to share `HIT_ARMOR` are now audibly different problems.
+  [SFX.SHIELD_HIT]: { type: 'arc', dur: 0.22, f0: 1200, f1: 480, noise: 0.16, gain: 0.32, minGap: 0.04 },
+  [SFX.SHIELD_BREAK]: { type: 'arpeggio', dur: 0.3, notes: [1400, 900], gain: 0.34 },
+  [SFX.ENEMY_STAGGER]: { type: 'noise', dur: 0.17, f0: 480, f1: 150, gain: 0.26, filter: 'bandpass', q: 2, minGap: 0.07 },
+  // Death mass: light bodies pop, heavy bodies land. Elites keep `HIT_KILL`.
+  [SFX.DEATH_LIGHT]: { type: 'tone', dur: 0.18, f0: 520, f1: 120, gain: 0.32, wave: 'triangle' },
+  [SFX.DEATH_HEAVY]: { type: 'tone', dur: 0.42, f0: 180, f1: 48, gain: 0.5, wave: 'sawtooth' },
+  // Elite abilities get their own voice, one per ability, so what the elite is
+  // doing can be identified without looking at it.
+  [SFX.ELITE_SHIELD]: { type: 'tone', dur: 0.5, f0: 220, f1: 880, gain: 0.34, wave: 'triangle', minGap: 0.2 },
+  [SFX.ELITE_SUMMON]: { type: 'arc', dur: 0.45, f0: 300, f1: 900, noise: 0.3, gain: 0.4, minGap: 0.2 },
+  [SFX.ELITE_BURST]: { type: 'tone', dur: 0.3, f0: 900, f1: 180, gain: 0.42, wave: 'square', minGap: 0.15 },
   [SFX.PLAYER_DAMAGE]: { type: 'tone', dur: 0.3, f0: 190, f1: 70, gain: 0.5, wave: 'sawtooth' },
   [SFX.PLAYER_DEATH]: { type: 'tone', dur: 1.1, f0: 240, f1: 40, gain: 0.55, wave: 'sawtooth' },
   [SFX.PLAYER_DASH]: { type: 'noise', dur: 0.24, f0: 1600, f1: 320, gain: 0.3, filter: 'highpass' },
@@ -121,9 +157,21 @@ const RECIPES = {
   [SFX.BOSS_SPAWN]: { type: 'tone', dur: 1.4, f0: 110, f1: 55, gain: 0.6, wave: 'sawtooth' },
   [SFX.BOSS_PHASE]: { type: 'arpeggio', dur: 0.7, notes: [330, 415, 220], gain: 0.42 },
   [SFX.BOSS_DEATH]: { type: 'explosion', dur: 2.0, gain: 0.7 },
+  // Boss support waves: a low swell that reads as "more is coming" without
+  // borrowing the boss's own spawn/phase cues.
+  [SFX.BOSS_WAVE]: { type: 'tone', dur: 0.9, f0: 90, f1: 124, gain: 0.48, wave: 'sawtooth', minGap: 0.5 },
   [SFX.LOOT_PICKUP]: { type: 'tone', dur: 0.1, f0: 800, f1: 1200, gain: 0.24, wave: 'triangle' },
   [SFX.LOOT_RARE]: { type: 'arpeggio', dur: 0.4, notes: [659, 880, 1174], gain: 0.34 },
+  // Rare is "valuable"; upgrade is "your kit changed". Chips and weapon-tier
+  // pickups use this so a permanent gain never sounds like salvage.
+  [SFX.LOOT_UPGRADE]: { type: 'arpeggio', dur: 0.5, notes: [659, 880, 1174, 1568], gain: 0.36 },
   [SFX.LEVEL_UP]: { type: 'arpeggio', dur: 0.7, notes: [523, 659, 784, 1046, 1318], gain: 0.38 },
+  // Low-health heartbeat: a quiet sub thump, throttled by the run so it warns
+  // without becoming a metronome.
+  [SFX.PLAYER_LOW_HEALTH]: { type: 'tone', dur: 0.5, f0: 92, f1: 62, gain: 0.3, wave: 'sine', minGap: 1.0 },
+  // Sector start is the low end of the transition hierarchy: descend keeps its
+  // rising arpeggio, the opening sector gets its own darker sting.
+  [SFX.SECTOR_START]: { type: 'arpeggio', dur: 0.5, notes: [196, 294, 392], gain: 0.32, minGap: 0.5 },
   [SFX.EXPLOSION]: { type: 'explosion', dur: 0.7, gain: 0.6 },
   [SFX.MELEE]: { type: 'noise', dur: 0.14, f0: 1200, f1: 300, gain: 0.32, filter: 'bandpass', q: 1.5 },
 };

@@ -17,10 +17,18 @@ import { clamp, dist2, rectCenter } from '../core/math.js';
 import {
   BOSS,
   ENEMY_IDS,
+  THREAT_PROFILES,
   ZONE_NAMES,
   difficultyAt,
 } from '../config/enemies.js';
-import { EXTRACTION, MAP_GEN_DEFAULTS, OBJECTIVE_TYPES } from '../config/balance.js';
+import {
+  EXTRACTION,
+  MAP_GEN_DEFAULTS,
+  OBJECTIVE_TYPES,
+  ROOM_RARITY_BOOST_CHANCE,
+  VAULT_LOOT_QUALITY_MUL,
+  VAULT_RARITY_BOOST_CHANCE,
+} from '../config/balance.js';
 
 const ROOM_PADDING = 2; // tiles of rock kept between a leaf and its room
 
@@ -101,7 +109,30 @@ function carveRect(map, rect) {
   }
 }
 
-function carveCorridor(map, fromTile, toTile, halfWidth, rng) {
+/**
+ * Normalise a tile-space point. Callers pass either `{x, y}` (hand-built tile
+ * coordinates) or the `{tx, ty}` shape returned by `TileMap.worldToTile`; both
+ * are accepted so a mismatched key can never silently carve corridors at NaN.
+ * @returns {{x:number,y:number}|null} `null` when the point is unusable.
+ */
+function tilePoint(point) {
+  if (!point) return null;
+  const x = point.tx ?? point.x;
+  const y = point.ty ?? point.y;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x: Math.floor(x), y: Math.floor(y) };
+}
+
+/**
+ * Carve an L-shaped corridor between two tile-space points.
+ * @returns {{from:{x:number,y:number},to:{x:number,y:number}}|null} the
+ *   normalised endpoints (for the minimap spine) or `null` when a point was
+ *   not a valid tile coordinate.
+ */
+function carveCorridor(map, fromPoint, toPoint, halfWidth, rng) {
+  const fromTile = tilePoint(fromPoint);
+  const toTile = tilePoint(toPoint);
+  if (!fromTile || !toTile) return null;
   const horizontalFirst = rng.bool();
   const x0 = Math.min(fromTile.x, toTile.x);
   const x1 = Math.max(fromTile.x, toTile.x);
@@ -139,8 +170,8 @@ function connectTree(map, node, halfWidth, rng, corridors) {
   if (!a || !b) return;
   const at = map.worldToTile(a.x + a.w / 2, a.y + a.h / 2);
   const bt = map.worldToTile(b.x + b.w / 2, b.y + b.h / 2);
-  carveCorridor(map, at, bt, halfWidth, rng);
-  corridors.push({ from: at, to: bt });
+  const corridor = carveCorridor(map, at, bt, halfWidth, rng);
+  if (corridor) corridors.push(corridor);
 }
 
 /**
@@ -305,8 +336,8 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
   for (const edge of edges) {
     const at = map.worldToTile(centers[edge.a].x, centers[edge.a].y);
     const bt = map.worldToTile(centers[edge.b].x, centers[edge.b].y);
-    carveCorridor(map, at, bt, halfWidth, rng);
-    corridorList.push({ from: at, to: bt });
+    const corridor = carveCorridor(map, at, bt, halfWidth, rng);
+    if (corridor) corridorList.push(corridor);
   }
   // Extra loops: connect a handful of random room pairs to remove dead ends.
   const extraLoops = clamp(Math.round(rooms.length * 0.22), 1, 5);
@@ -316,8 +347,8 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
     if (b === a) b = (b + 1) % rooms.length;
     const at = map.worldToTile(centers[a].x, centers[a].y);
     const bt = map.worldToTile(centers[b].x, centers[b].y);
-    carveCorridor(map, at, bt, halfWidth, rng);
-    corridorList.push({ from: at, to: bt, loop: true });
+    const corridor = carveCorridor(map, at, bt, halfWidth, rng);
+    if (corridor) corridorList.push({ ...corridor, loop: true });
   }
 
   // Classify rooms. Sort by distance from the spawn room so roles are spatial.
@@ -395,7 +426,6 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
   const objectives = buildObjectives({
     rng,
     tier,
-    difficulty,
     isBossSector,
     objectiveRoom,
     objectivePosition,
@@ -405,6 +435,15 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
     spawnPoint,
   });
 
+  // Rolled here so the sector descriptor can name the garrison profile the HUD
+  // shows on the sector banner; the draw happens where the spawn pass used to
+  // take it, so generation stays deterministic per seed.
+  const threatProfile = pickThreatProfile(rng, tier);
+  // The commander's room is picked geometrically (the deepest room that is not
+  // a critical one), so the spawn pass can garrison it like any other prize.
+  const huntRoom = objectives.some((o) => o.type === OBJECTIVE_TYPES.HUNT)
+    ? pickCommandRoom(zoneRooms, spawnPoint)
+    : null;
   const enemySpawns = buildEnemySpawns({
     rng,
     tier,
@@ -413,7 +452,15 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
     spawnRoomId: spawnRoomIndex,
     bossRoomId: bossRoom ? bossRoom.id : -1,
     isBossSector,
+    spawnPoint,
+    profile: threatProfile,
+    map,
+    objectives,
+    huntRoom,
   });
+
+  assignHuntTarget(objectives, enemySpawns, huntRoom);
+  reconcileEliminateTarget(objectives, enemySpawns);
 
   const lootSpawns = buildLootSpawns({ rng, tier, difficulty, zoneRooms, objectives });
 
@@ -449,6 +496,7 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
       : null,
     objectives,
     enemySpawns,
+    threatProfile: { id: threatProfile.id, name: threatProfile.name },
     lootSpawns,
     props,
     lights,
@@ -462,7 +510,7 @@ function buildZone({ rng, tier, difficulty, params, seed, attempt }) {
 
 function buildObjectives(ctx) {
   const {
-    rng, tier, difficulty, isBossSector, objectiveRoom, objectivePosition, bossRoom, map, zoneRooms, spawnPoint,
+    rng, tier, isBossSector, objectiveRoom, objectivePosition, bossRoom, map, zoneRooms, spawnPoint,
   } = ctx;
 
   if (isBossSector && bossRoom) {
@@ -485,13 +533,33 @@ function buildObjectives(ctx) {
     ];
   }
 
+  // Pool entries carry a `minTier` like the threat profiles do: tier 1 keeps its
+  // curated three, and the commander hunt - a marked elite with a bodyguard -
+  // opens once the player has kit to answer it with.
   const pool = [
     {
       type: OBJECTIVE_TYPES.ELIMINATE,
       title: 'PURGE HOSTILES',
       build: () => ({
-        target: Math.round(12 + tier * 4 + difficulty.threatBudget * 0.25),
+        // Provisional only: the real target is derived from the hostiles the
+        // sector actually spawns (see reconcileEliminateTarget), because the
+        // spawn pass spends a threat budget at a per-archetype cost, so the
+        // enemy count cannot be known while the objective pool is built.
+        target: 1,
         description: 'Clear the zone of hostile signatures.',
+      }),
+    },
+    {
+      type: OBJECTIVE_TYPES.HUNT,
+      minTier: 2,
+      title: 'ASSASSINATE THE COMMANDER',
+      build: () => ({
+        // The commander is promoted from the sector's own garrison after the
+        // spawn pass (see assignHuntTarget): one guaranteed elite with a
+        // bodyguard, instead of the "clear everything" or "collect three
+        // things" shape the other objectives use.
+        target: 1,
+        description: 'A sector commander leads this garrison. Cut it down.',
       }),
     },
     {
@@ -511,7 +579,7 @@ function buildObjectives(ctx) {
       }),
     },
   ];
-  const chosen = rng.pick(pool);
+  const chosen = rng.pick(pool.filter((entry) => (entry.minTier ?? 1) <= (tier ?? 1)));
   const spec = chosen.build();
 
   const objectiveListPosition = objectivePosition;
@@ -558,36 +626,251 @@ function buildObjectives(ctx) {
   return objectives;
 }
 
-function buildEnemySpawns({ rng, tier, difficulty, zoneRooms, spawnRoomId, bossRoomId, isBossSector }) {
-  const spawns = [];
-  const budget = difficulty.threatBudget;
-  const archetypes = tier <= 1 ? ['husk', 'husk', 'dart', 'marksman'] : ENEMY_IDS;
+/**
+ * Picks the sector's threat profile. Tier 1 always fields the curated opener so
+ * the first sector reads as an introduction; from tier 2 the sector rolls one of
+ * the garrison profiles, which is what makes two sectors at the same depth play
+ * differently instead of fielding the same soup in a different shape.
+ */
+function pickThreatProfile(rng, tier) {
+  if (tier <= 1) return THREAT_PROFILES.find((p) => p.id === 'patrol');
+  // Late sectors draw from a wider pool: profiles carry a `minTier`, so a deep
+  // sector can field garrisons the early ones never roll instead of the same
+  // four with a bigger budget.
+  const options = THREAT_PROFILES.filter((p) => p.id !== 'patrol' && (p.minTier ?? 1) <= tier);
+  return rng.pick(options);
+}
+
+function weightedArchetype(rng, weights, fallback = 'husk') {
+  const entries = Object.entries(weights).filter(([id]) => ENEMY_IDS.includes(id));
+  if (entries.length === 0) return fallback;
+  const total = entries.reduce((sum, [, w]) => sum + Math.max(0, w), 0);
+  if (total <= 0) return fallback;
+  let roll = rng.next() * total;
+  for (const [id, w] of entries) {
+    roll -= Math.max(0, w);
+    if (roll <= 0) return id;
+  }
+  return entries[entries.length - 1][0];
+}
+
+/**
+ * Places one encounter group: a hotspot inside `room` plus `size` members
+ * scattered around it. Squads are what turn a sector from a field of lone
+ * wanderers into fights with a front and a back — reinforced by the profile,
+ * so a GUNLINE sector presents firing lines and a SWARM sector presents packs.
+ * Returns how much threat budget it actually spent.
+ */
+function placeSquad({ rng, room, profile, size, difficulty, spawns, budgetLeft, costOf, map }) {
+  const spots = room.enemySpots;
+  if (!spots || spots.length === 0) return 0;
+  // Anchor on a free spot: two squads landing on the same sampled point would
+  // put enemies in the same tile, which reads as a single flickering unit.
+  let hot = rng.pick(spots);
+  let anchorTries = 0;
+  while (hot && anchorTries < 5 && spawns.some((s) => dist2(s.x, s.y, hot.x, hot.y) < 34 * 34)) {
+    anchorTries += 1;
+    hot = rng.pick(spots);
+  }
+  if (!hot || spawns.some((s) => dist2(s.x, s.y, hot.x, hot.y) < 18 * 18)) return 0;
   let spent = 0;
+  let placed = 0;
   let guard = 0;
-  while (spent < budget && guard < 400) {
+  // How far members stand from the hotspot is part of the profile's identity:
+  // a SWARM collapses into one burst, a GUNLINE spreads into a line that has to
+  // be picked apart in order.
+  const [spreadMin, spreadMax] = profile.spread ?? [24, 86];
+  while (placed < size && spent < budgetLeft && guard < 24) {
     guard += 1;
-    const room = rng.pick(zoneRooms);
-    if (room.id === spawnRoomId && spawns.length < 3) continue;
-    if (room.id === bossRoomId) continue;
-    if (room.enemySpots.length === 0) continue;
-    if (isBossSector && room.type === 'objective') continue;
-    const spot = rng.pick(room.enemySpots);
-    if (!spot) continue;
-    const nearby = spawns.filter((s) => dist2(s.x, s.y, spot.x, spot.y) < 300 * 300);
-    if (nearby.length > 4) continue;
-    const typeId = rng.pick(archetypes);
-    const cost = { husk: 2, dart: 2, marksman: 3, brute: 6, spitter: 4 }[typeId] ?? 3;
-    const elite = rng.next() < difficulty.eliteChance && typeId !== 'husk';
+    const index = spawns.length;
+    // Draw order is fixed per attempt (angle, radius, archetype, elite roll) so
+    // the same seed keeps producing the same garrison.
+    const angle = rng.angle();
+    const radius = placed === 0 ? 0 : rng.float(spreadMin, spreadMax);
+    const x = hot.x + Math.cos(angle) * radius;
+    const y = hot.y + Math.sin(angle) * radius;
+    const typeId = weightedArchetype(rng, profile.weights);
+    const cost = costOf(typeId);
+    if (spent + cost > budgetLeft) break;
+    // A squad member squeezed against a wall would be unreachable: fall back to
+    // the room's own sampled spot rather than placing it in rock.
+    let px = x, py = y;
+    const blocked = map && !map.isFloor(map.worldToTile(px, py).tx, map.worldToTile(py, py).ty);
+    if (blocked) {
+      // Squads hug walls: walk the room's own sampled points for one that is both
+      // standable and free, instead of stacking two enemies in the same tile.
+      let found = null;
+      for (let k = 0; k < spots.length; k += 1) {
+        const candidate = spots[(index + placed + k) % spots.length];
+        if (!candidate) continue;
+        if (map && !map.isFloor(map.worldToTile(candidate.x, candidate.y).tx, map.worldToTile(candidate.y, candidate.y).ty)) continue;
+        if (spawns.some((s) => dist2(s.x, s.y, candidate.x, candidate.y) < 24 * 24)) continue;
+        found = candidate;
+        break;
+      }
+      if (!found) continue;
+      px = found.x;
+      py = found.y;
+    }
+    // Two enemies in the same tile read as one flickering unit: keep members at
+    // least a body-width apart, and the room from becoming a single blob.
+    if (spawns.some((s) => dist2(s.x, s.y, px, py) < 18 * 18)) continue;
+    const nearby = spawns.filter((s) => dist2(s.x, s.y, px, py) < 190 * 190);
+    if (nearby.length > 6) continue;
+    const wantsElite = profile.elites.includes(typeId);
+    const elite = wantsElite && rng.next() < difficulty.eliteChance;
     spawns.push({
-      x: spot.x,
-      y: spot.y,
+      x: px,
+      y: py,
       typeId,
       elite: elite ? (rng.next() < 0.25 ? 'champion' : 'elite') : null,
       roomId: room.id,
       dormant: true,
+      squadId: room.id * 100 + index,
     });
     spent += elite ? cost * 2 : cost;
+    placed += 1;
   }
+  return spent;
+}
+
+function buildEnemySpawns({
+  rng, tier, difficulty, zoneRooms, spawnRoomId, bossRoomId, isBossSector, spawnPoint, profile, map,
+  objectives, huntRoom,
+}) {
+  const spawns = [];
+  const budget = difficulty.threatBudget;
+  const costOf = (typeId) => ({ husk: 2, dart: 2, marksman: 3, brute: 6, spitter: 4 }[typeId] ?? 3);
+  let spent = 0;
+
+  const maxDist = Math.max(
+    1,
+    ...zoneRooms.map((room) => Math.hypot(room.center.x - spawnPoint.x, room.center.y - spawnPoint.y)),
+  );
+  const distanceFraction = (room) => (
+    Math.hypot(room.center.x - spawnPoint.x, room.center.y - spawnPoint.y) / maxDist
+  );
+
+  // Guards first: a vault (4-6 loot spots) and the objective room are worth
+  // defending, so their reward is earned rather than collected in passing. This
+  // is what gives the sector a risk/reward gradient instead of flat danger.
+  const guardTargets = zoneRooms
+    .filter((room) => {
+      if (room.id === spawnRoomId || room.id === bossRoomId) return false;
+      if (room.type === 'vault') return true;
+      if (huntRoom && room.id === huntRoom.id) return true;
+      return !isBossSector && room.type === 'objective';
+    })
+    .sort((a, b) => distanceFraction(b) - distanceFraction(a) || a.id - b.id);
+  // Every prize room gets a garrison: a vault that is sometimes free and
+  // sometimes guarded would make the reward a coin flip instead of a decision.
+  // The per-room size cap is what bounds the guard share of the budget, so the
+  // rest of the sector still gets its own garrison.
+  // The objective's own prizes are paid for first: they are mandatory content,
+  // and a sector whose vaults are all fortified must still defend the shard the
+  // objective sends the player to. Garrison spend is capped as a share of the
+  // budget so the route garrison is never starved by its own prize rooms.
+  // Markers are paid for first, from the same budget as everything else: a
+  // sector whose vaults are all fortified must still defend the shard the
+  // objective sends the player to. There is no separate prize cap - the
+  // per-room garrison sizes are the bound, and the general pass below spends
+  // whatever is left, which is what keeps the rest of the sector populated.
+  const guardCap = budget;
+  if (Array.isArray(objectives) && (profile.markerGuard ?? 0) > 0) {
+    let markerIndex = 0;
+    for (const objective of objectives) {
+      if (objective.type !== OBJECTIVE_TYPES.RECOVER && objective.type !== OBJECTIVE_TYPES.DESTROY) continue;
+      const size = Math.max(1, Math.min(profile.markerGuard, profile.squad[1]));
+      for (const marker of objective.markers ?? []) {
+        if (spent >= guardCap) break;
+        markerIndex += 1;
+        // Sample inside the marker's own room (padded a little) rather than a
+        // fixed box: a marker near a room edge would otherwise sit in a box that
+        // is mostly rock, the sampling would fail and the prize would go
+        // undefended. The nearest spots win, so the garrison holds the prize
+        // itself rather than the far corner of its room.
+        const room = zoneRooms.find((r) => r.id === marker.roomId);
+        const rect = room
+          ? { x: room.rect.x - 48, y: room.rect.y - 48, w: room.rect.w + 96, h: room.rect.h + 96 }
+          : { x: marker.x - 130, y: marker.y - 130, w: 260, h: 260 };
+        const spots = sampleRoomSpots(map, { rect }, rng, 8, 26)
+          .sort((a, b) => dist2(a.x, a.y, marker.x, marker.y) - dist2(b.x, b.y, marker.x, marker.y))
+          .slice(0, 4);
+        if (spots.length === 0) continue;
+        spent += placeSquad({
+          rng,
+          // Negative ids keep marker garrisons out of the room id space.
+          room: { id: -markerIndex, enemySpots: spots },
+          profile,
+          size,
+          difficulty,
+          spawns,
+          budgetLeft: guardCap - spent,
+          costOf,
+          map,
+        });
+      }
+    }
+  }
+
+  for (const room of guardTargets) {
+    if (room.enemySpots.length === 0) continue;
+    // The command room holds the objective's target, so it gets one body more
+    // than a normal garrison; a vault keeps its ordinary guard and earns its
+    // extra pressure from the richer cache it pays out.
+    const isCommand = Boolean(huntRoom) && room.id === huntRoom.id;
+    const wanted = isCommand ? profile.guard + 1 : profile.guard;
+    const size = Math.min(wanted, profile.squad[1] + (isCommand ? 1 : 0));
+    if (spent >= guardCap) break;
+    spent += placeSquad({
+      rng,
+      room,
+      profile,
+      size,
+      difficulty,
+      spawns,
+      budgetLeft: guardCap - spent,
+      costOf,
+      map,
+    });
+  }
+
+  // Then the rest of the garrison, room by room. Group size is graded by depth:
+  // the interior gets full squads, the middle of the sector gets pairs, and the
+  // approach gets lone sentries. That keeps encounters as the unit of combat
+  // without leaving the route the player actually walks through empty, and it
+  // still escalates instead of front-loading the fight.
+  const candidates = zoneRooms.filter((room) => (
+    room.id !== spawnRoomId && room.id !== bossRoomId
+    && room.enemySpots.length > 0
+    && !(isBossSector && room.type === 'objective')
+  ));
+  const ordered = candidates
+    .slice()
+    .sort((a, b) => distanceFraction(b) - distanceFraction(a) || a.id - b.id);
+  const groupSize = (fraction, pass) => {
+    if (pass > 1) return rng.int(profile.squad[0], profile.squad[1]);
+    if (fraction > 0.55) return rng.int(profile.squad[0], profile.squad[1]);
+    if (fraction > 0.28) return rng.int(1, profile.squad[0]);
+    return 1;
+  };
+  let pass = 0;
+  let guard = 0;
+  while (spent < budget && pass < 6 && guard < 400 && ordered.length > 0) {
+    pass += 1;
+    for (const room of ordered) {
+      if (spent >= budget || guard >= 400) break;
+      guard += 1;
+      const fraction = distanceFraction(room);
+      if (pass > 1 && fraction < 0.3) continue;
+      if (pass > 2 && fraction < 0.6) continue;
+      const size = groupSize(fraction, pass);
+      spent += placeSquad({
+        rng, room, profile, size, difficulty, spawns, budgetLeft: budget - spent, costOf, map,
+      });
+    }
+  }
+
   if (isBossSector && bossRoomId >= 0) {
     const bossRoom = zoneRooms.find((r) => r.id === bossRoomId);
     if (bossRoom) {
@@ -605,17 +888,102 @@ function buildEnemySpawns({ rng, tier, difficulty, zoneRooms, spawnRoomId, bossR
   return spawns;
 }
 
+/**
+ * The room the commander objective is built around: the deepest room that is
+ * not a critical route room (spawn / exit / descent). It draws no random
+ * numbers, so adding the objective does not shift the generation stream.
+ */
+function pickCommandRoom(zoneRooms, spawnPoint) {
+  const nonCritical = zoneRooms.filter((r) => !['spawn', 'exit', 'descend'].includes(r.type));
+  const pool = nonCritical.length > 0 ? nonCritical : zoneRooms.filter((r) => r.type !== 'spawn');
+  let best = null;
+  let bestDistance = -1;
+  for (const room of pool) {
+    const d = dist2(room.center.x, room.center.y, spawnPoint.x, spawnPoint.y);
+    if (d > bestDistance || (d === bestDistance && best && room.id < best.id)) {
+      bestDistance = d;
+      best = room;
+    }
+  }
+  return best;
+}
+
+/**
+ * Picks the commander: the sector's own elite closest to the command room,
+ * promoted to an elite if this sector rolled none (the objective's target is
+ * content, not a lucky spawn). Runs after the spawn pass and draws no random
+ * numbers, so generation order and every other seed's output are untouched.
+ */
+function assignHuntTarget(objectives, enemySpawns, huntRoom) {
+  const objective = objectives.find((o) => o.type === OBJECTIVE_TYPES.HUNT);
+  if (!objective) return;
+  const anchor = huntRoom ? huntRoom.center : null;
+  let best = null;
+  let bestScore = Infinity;
+  for (let index = 0; index < enemySpawns.length; index += 1) {
+    const spawn = enemySpawns[index];
+    if (spawn.isBoss) continue;
+    const distance = anchor ? dist2(spawn.x, spawn.y, anchor.x, anchor.y) : index;
+    // An existing elite wins over proximity: the commander should be the
+    // toughest thing on the map, not the nearest thing to a room.
+    const score = (spawn.elite ? 0 : 1) * 1e9 + distance;
+    if (score < bestScore) {
+      bestScore = score;
+      best = { spawn, index };
+    }
+  }
+  if (!best) return;
+  if (!best.spawn.elite) {
+    // Promoted after the budget was spent, so this one elite is threat beyond
+    // the sector's budget - deliberate, and the smallest possible correction
+    // that keeps the objective solvable.
+    best.spawn.elite = 'elite';
+  }
+  best.spawn.isCommander = true;
+  objective.targetSpawnIndex = best.index;
+  objective.targetPosition = { x: best.spawn.x, y: best.spawn.y };
+}
+
+/**
+ * A purge objective must always be satisfiable. The spawn pass spends a threat
+ * budget at a per-archetype cost, so the number of hostiles it yields varies
+ * with the archetypes it rolls; a target computed independently from the budget
+ * could therefore exceed what the sector can ever contain and leave the
+ * extraction gate locked for the whole run. Deriving the target from the spawns
+ * that actually exist keeps the objective honest, and a small margin means a
+ * single hostile that ends up unreachable cannot dead-end the sector.
+ *
+ * Runs after the spawn pass on purpose: generation order (and therefore the RNG
+ * stream, zone layout and fingerprints) is unchanged.
+ */
+function reconcileEliminateTarget(objectives, enemySpawns) {
+  let hostiles = 0;
+  for (const spawn of enemySpawns) {
+    if (!spawn.isBoss) hostiles += 1;
+  }
+  const target = Math.max(0, Math.min(hostiles, Math.round(hostiles * 0.8)));
+  for (const objective of objectives) {
+    if (objective.type === OBJECTIVE_TYPES.ELIMINATE && !objective.complete) objective.target = target;
+  }
+}
+
 function buildLootSpawns({ rng, tier, difficulty, zoneRooms, objectives }) {
   const spawns = [];
   for (const room of zoneRooms) {
+    // A vault pays better per drop, not just more drops: its garrison is the
+    // price, and a room you have to fight through should not hand back the same
+    // cache an empty corridor does.
+    const vault = room.type === 'vault';
+    const quality = clamp01Safe(difficulty.lootMul * (vault ? VAULT_LOOT_QUALITY_MUL : 1));
+    const boostChance = vault ? VAULT_RARITY_BOOST_CHANCE : ROOM_RARITY_BOOST_CHANCE;
     for (const spot of room.lootSpots) {
       spawns.push({
         x: spot.x,
         y: spot.y,
         roomId: room.id,
         tier,
-        quality: clamp01Safe(difficulty.lootMul),
-        rarityBoost: rng.next() < 0.12 ? 1 : 0,
+        quality,
+        rarityBoost: rng.next() < boostChance ? 1 : 0,
       });
     }
   }

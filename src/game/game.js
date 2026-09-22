@@ -58,6 +58,8 @@ export class Game {
     this.state = GAME_STATE.BOOT;
     this.previousState = GAME_STATE.MENU;
     this.time = 0;
+    /** When the current state was entered; used only for UI entrance transitions. */
+    this.stateEnteredAt = 0;
     this.frameCount = 0;
     this.fps = 0;
     this._fpsAccumulator = 0;
@@ -98,6 +100,14 @@ export class Game {
       onError: (error, context) => this.reportError(error, `render:${context}`),
     });
     this.ui = new UIContext();
+    // The HUD and the renderer both read `ui.settings.video`; without this the
+    // HUD threw on every frame that drew the minimap. Settings objects are
+    // mutated in place by the settings screen, so a shared reference is stable.
+    this.ui.settings = this.profile.settings;
+    // Presentation preference only: honour the OS reduced-motion setting so
+    // screen transitions never animate for players who ask for stillness.
+    this.ui.reducedMotion = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     this.hud = new Hud();
 
     this.screens = {
@@ -118,7 +128,13 @@ export class Game {
       if (document.hidden && this.state === GAME_STATE.PLAYING) this.pause();
     };
     document.addEventListener('visibilitychange', this._onVisibility);
-    this._onBeforeUnload = () => this.persistProfile();
+    // Unloading (close, reload, navigate) flushes the profile. A run still in
+    // progress is snapshotted first, so the resume point matches the moment the
+    // page went away instead of falling back to the last checkpoint; it is the
+    // same payload a pause writes and still exactly one storage write.
+    this._onBeforeUnload = () => {
+      if (!this._checkpointRun()) this.persistProfile();
+    };
     window.addEventListener('beforeunload', this._onBeforeUnload);
 
     this.resize();
@@ -138,6 +154,10 @@ export class Game {
   start() {
     if (this.running) return;
     this.running = true;
+    // Nothing else ever leaves BOOT, which left the state machine stuck in
+    // "boot" while the menu was already on screen. The loop owning the first
+    // frame is what ends the boot phase.
+    if (this.state === GAME_STATE.BOOT) this.setState(GAME_STATE.MENU);
     this.lastFrameTime = performance.now();
     const loop = (now) => {
       if (!this.running) return;
@@ -231,6 +251,7 @@ export class Game {
     if (this.state === next) return;
     this.previousState = this.state;
     this.state = next;
+    this.stateEnteredAt = this.time;
     this.events.emit('game:state', { from: this.previousState, to: next });
     if (next === GAME_STATE.MENU) {
       this.audio.startMusic(MUSIC_STATES.MENU);
@@ -292,6 +313,17 @@ export class Game {
     this.events.emit('run:resume', { seed: resume.seed, tier: resume.tier });
   }
 
+  /**
+   * Replays the current contract from sector 1 with the same seed.
+   *
+   * This is a retry, not an exit: the attempt in progress is intentionally
+   * discarded without settlement - no salvage is banked and no run/death is
+   * recorded, because the run is not ending, it is starting over. Settling a
+   * retry would also let a player bank salvage and then replay the same loot
+   * from the same seed, so discarding is the safe side of the asymmetry.
+   * Leaving a run for good goes through `quitToMenu()`, whose abandon path
+   * settles exactly once like a death.
+   */
   restartRun() {
     const seed = this.run ? this.run.seed : this.pendingSeed;
     this._createRun({ seed, startTier: 1, resume: null });
@@ -314,6 +346,7 @@ export class Game {
       audio: this.audio,
       events: this.events,
       genParams: {},
+      onCheckpoint: () => this._checkpointRun(),
     });
     this.run.particles.density = this.profile.settings.video.particles;
     this.run.floatingText.enabled = this.profile.settings.video.damageNumbers;
@@ -321,19 +354,28 @@ export class Game {
     this.run.camera.setBounds(this.run.zone.bounds);
     this.resultsSummary = null;
     this.resultsResult = null;
-    // Clearing the stored run marks it as in-progress; it is re-saved on pause
-    // and on every sector change.
+    // The stored run marks it as in-progress; it is re-saved on pause and on
+    // every sector change.
+    this._checkpointRun();
+  }
+
+  /**
+   * Refreshes the resumable-run snapshot from the live run and writes it.
+   * This is the single writer of `profile.run` during a run: it runs at run
+   * creation, on pause (including the automatic pause when the page becomes
+   * hidden), on every sector change (via the run's checkpoint hook) and when
+   * the page is unloaded. A finished run never leaves a resume behind.
+   */
+  _checkpointRun() {
+    if (!this.run || this.run.finished) return false;
     this.profile.run = this.run.serializeForResume();
-    this.persistProfile();
+    return this.persistProfile();
   }
 
   pause() {
     if (this.state !== GAME_STATE.PLAYING) return;
     this.setState(GAME_STATE.PAUSED);
-    if (this.run) {
-      this.profile.run = this.run.serializeForResume();
-      this.persistProfile();
-    }
+    this._checkpointRun();
     this.audio.play(SFX.UI_CLICK);
   }
 
@@ -423,6 +465,11 @@ export class Game {
     if (input.wasPressed('cancel') && !typing) {
       if (this.state === GAME_STATE.UPGRADES || this.state === GAME_STATE.HELP || this.state === GAME_STATE.SETTINGS) this.goBack();
     }
+    // Enter / Space activate whatever the player is pointing at or focused with
+    // the keyboard. The results screen keeps its own Enter = New Run shortcut.
+    if (!typing && this.state !== GAME_STATE.RESULTS && input.wasPressed('confirm')) {
+      this.ui.activateFocused();
+    }
     if (this.state === GAME_STATE.RESULTS && !typing && input.wasPressed('confirm')) {
       this.startRun();
     }
@@ -472,6 +519,28 @@ export class Game {
     );
     this.lastUiWidth = ui.width;
     this.lastUiHeight = ui.height;
+    // Presentation-only hints for the UI layer: how long the current screen has
+    // been on screen, and where toasts should dock (they would otherwise sit on
+    // top of the in-run HUD).
+    ui.stateTime = this.time - this.stateEnteredAt;
+    const toastsVisible = this.toastStack.items.length > 0;
+    if (this.state === GAME_STATE.PAUSED || this.state === GAME_STATE.RESULTS) {
+      // Full-panel modals: the toast takes a strip of its own at the top and
+      // the panel is nudged down, so a notification never covers their content.
+      ui.toastAnchor = 'top';
+      ui.toastY = 10;
+      ui.toastInset = toastsVisible ? 42 : 0;
+    } else if (IN_GAME_STATES.has(this.state)) {
+      // In-run, toasts drop in under the objective panel.
+      ui.toastAnchor = 'top';
+      ui.toastY = 150;
+      ui.toastInset = 0;
+    } else {
+      // Menus: above their footer / bottom hints.
+      ui.toastAnchor = 'bottom';
+      ui.toastY = ui.height - 66;
+      ui.toastInset = 0;
+    }
 
     const scene = {
       run: IN_GAME_STATES.has(this.state) ? this.run : null,

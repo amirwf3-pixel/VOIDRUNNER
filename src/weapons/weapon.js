@@ -8,7 +8,7 @@
  */
 
 import { clamp } from '../core/math.js';
-import { getWeaponDef, roundsPerSecond, tierDamageMul, tierMagazineBonus } from '../config/weapons.js';
+import { getWeaponDef, isKnownWeaponId, roundsPerSecond, tierDamageMul, tierMagazineBonus } from '../config/weapons.js';
 
 export const WEAPON_STATE = {
   READY: 'ready',
@@ -240,15 +240,38 @@ export class WeaponInstance {
     return { id: this.id, tier: this.tier, ammo: this.ammo };
   }
 
+  /**
+   * Rebuilds an instance from saved data.
+   *
+   * Accepts the legacy bare-id form (`'smg'`) as well as the current object form
+   * (`{id, tier, ammo}`); a bare id means "tier 1, full magazine", which is what
+   * runs saved before weapon tiers/ammo were persisted always restored to.
+   * `tier`/`ammo` are only honoured when they are finite numbers, so malformed
+   * values fall back to those same defaults instead of producing NaN state.
+   * Ids this build does not define - removed weapons, hand-edited saves,
+   * inherited object keys - are dropped with one bounded warning. The entry
+   * itself and a stack trace are deliberately not logged: they would only echo
+   * untrusted save data into the console.
+   * @returns {WeaponInstance|null} null when the entry cannot be restored
+   */
   static deserialize(data) {
-    if (!data || typeof data.id !== 'string') return null;
+    const spec = typeof data === 'string' ? { id: data } : data;
+    if (!spec || typeof spec.id !== 'string') return null;
+    if (!isKnownWeaponId(spec.id)) {
+      const shown = spec.id.replace(/[^\x20-\x7e]/g, '?').slice(0, 32);
+      console.warn(`[Weapon] skipping unknown weapon id "${shown}"`);
+      return null;
+    }
     try {
-      const instance = new WeaponInstance(data.id, clamp(Math.round(data.tier ?? 1), 1, 3));
-      instance.ammo = clamp(Math.round(data.ammo ?? instance.magazineSize), 0, instance.magazineSize);
+      const tier = Number.isFinite(spec.tier) ? clamp(Math.round(spec.tier), 1, 3) : 1;
+      const instance = new WeaponInstance(spec.id, tier);
+      instance.ammo = Number.isFinite(spec.ammo)
+        ? clamp(Math.round(spec.ammo), 0, instance.magazineSize)
+        : instance.magazineSize;
       instance.state = instance.ammo > 0 ? WEAPON_STATE.READY : WEAPON_STATE.EMPTY;
       return instance;
     } catch (error) {
-      console.warn('[Weapon] failed to deserialize', data, error);
+      console.warn('[Weapon] failed to deserialize', error);
       return null;
     }
   }

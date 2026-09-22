@@ -37,6 +37,16 @@ export const XP_CURVE = {
   maxLevel: 60,
 };
 
+/**
+ * Run XP granted for finishing a sector objective, scaled by the sector's own
+ * xp multiplier. Kills used to be the only XP source, so the one step of the
+ * loop that is always required - reach the objective and complete it - paid
+ * nothing, and play was pushed toward farming kills instead. Measured effect is
+ * deliberately modest: about 15% of a tier-1 sector's XP and 8% of a tier-6
+ * one, worth roughly one extra level over a six-sector run.
+ */
+export const OBJECTIVE_XP_BASE = 50;
+
 export function xpForLevel(level) {
   return Math.round(XP_CURVE.base * Math.pow(XP_CURVE.growth, Math.max(0, level - 1)));
 }
@@ -239,8 +249,8 @@ export const RESOURCE_DEFS = {
  * `minTier` gates entries behind sector depth so deep runs feel rewarding.
  */
 export const LOOT_TABLE = [
-  { id: 'scrap', weight: 42, qty: [3, 9], rarity: 'common' },
-  { id: 'cells', weight: 20, qty: [1, 3], rarity: 'common' },
+  { id: 'scrap', weight: 26, qty: [3, 9], rarity: 'common' },
+  { id: 'cells', weight: 12, qty: [1, 3], rarity: 'common' },
   { id: 'cores', weight: 14, qty: [1, 3], rarity: 'uncommon' },
   { id: 'ammo_light', weight: 30, qty: [12, 26], rarity: 'common' },
   { id: 'ammo_rifle', weight: 22, qty: [10, 22], rarity: 'common' },
@@ -255,6 +265,37 @@ export const LOOT_TABLE = [
   { id: 'weapon', weight: 11, qty: [1, 1], rarity: 'rare', minTier: 1 },
   { id: 'upgrade_chip', weight: 4, qty: [1, 1], rarity: 'epic', minTier: 3 },
 ];
+
+/**
+ * Weapon-drop tier odds by sector depth. Weapon tier is the game's in-run
+ * refinement axis (damage and magazine size), so a fixed roll meant late
+ * sectors kept handing back tier-1 duplicates — rewards that resolve to six
+ * scrap. Depth shifts the odds instead of adding more drops.
+ */
+export const LOOT_WEAPON_TIER_WEIGHTS = {
+  1: [{ tier: 1, weight: 62 }, { tier: 2, weight: 28 }, { tier: 3, weight: 10 }],
+  2: [{ tier: 1, weight: 50 }, { tier: 2, weight: 34 }, { tier: 3, weight: 16 }],
+  3: [{ tier: 1, weight: 38 }, { tier: 2, weight: 38 }, { tier: 3, weight: 24 }],
+  4: [{ tier: 1, weight: 26 }, { tier: 2, weight: 40 }, { tier: 3, weight: 34 }],
+  5: [{ tier: 1, weight: 18 }, { tier: 2, weight: 38 }, { tier: 3, weight: 44 }],
+  6: [{ tier: 1, weight: 12 }, { tier: 2, weight: 34 }, { tier: 3, weight: 54 }],
+};
+
+/**
+ * Prize-room loot. A vault is the sector's richest room and the only one the
+ * generator garrisons on purpose, so its drops are worth more per drop
+ * (`quality` scales stack sizes) and roll rarer more often. Ordinary rooms keep
+ * the old odds.
+ */
+export const VAULT_LOOT_QUALITY_MUL = 1.35;
+export const VAULT_RARITY_BOOST_CHANCE = 0.3;
+export const ROOM_RARITY_BOOST_CHANCE = 0.12;
+
+/** Odds for a sector, clamped to the deepest defined tier. */
+export function weaponTierWeights(sectorTier = 1) {
+  const tier = Math.min(6, Math.max(1, Math.round(sectorTier) || 1));
+  return LOOT_WEAPON_TIER_WEIGHTS[tier];
+}
 
 export const RARITY_COLORS = {
   common: '#9fb3c8',
@@ -276,6 +317,7 @@ export const OBJECTIVE_TYPES = {
   ELIMINATE: 'eliminate',
   RECOVER: 'recover',
   DESTROY: 'destroy',
+  HUNT: 'hunt',
   BOSS: 'boss',
 };
 

@@ -39,6 +39,15 @@ body {
   background: radial-gradient(circle at 30% 40%, #0b1420 0%, #05070b 70%);
 }
 
+#game-root::after {
+  /* Subtle vignette so HUD panels at the edges always sit on a darker surface. */
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 45%, rgba(0, 0, 0, 0) 45%, rgba(0, 0, 0, 0.35) 100%);
+}
+
 #game-canvas {
   display: block;
   width: 100%;
@@ -50,6 +59,16 @@ body {
 
 #game-canvas:focus-visible {
   box-shadow: inset 0 0 0 2px rgba(127, 230, 255, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #boot-overlay {
+    transition: none;
+  }
+
+  .boot-inner {
+    animation: none;
+  }
 }
 
 #boot-overlay {
@@ -85,6 +104,25 @@ body {
 
 .boot-logo span {
   color: var(--accent);
+}
+
+.boot-tagline {
+  margin-top: -10px;
+  font-family: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 6px;
+  color: var(--dim);
+}
+
+.boot-hint {
+  margin-top: 6px;
+  font-family: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: rgba(125, 142, 163, 0.6);
+  text-align: center;
 }
 
 .boot-bar {

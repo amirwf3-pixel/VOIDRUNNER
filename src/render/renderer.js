@@ -12,7 +12,7 @@
 import { TAU, clamp, damp, dist2, lerp } from '../core/math.js';
 import { FLOOR, SOLID, TILE } from '../world/tilemap.js';
 import { FONTS, PALETTE, rgba } from '../config/palette.js';
-import { ENEMY_STATES } from '../config/enemies.js';
+import { ELITE_ABILITY, ENEMY_STATES } from '../config/enemies.js';
 import { DROP_KIND } from '../loot/loot.js';
 import { PROP_KINDS } from '../world/world.js';
 
@@ -530,7 +530,18 @@ export class Renderer {
       if (enemy.y < view.y - 80 || enemy.y > view.y + view.h + 80) continue;
 
       ctx.save();
-      ctx.translate(enemy.x, enemy.y);
+      // A stagger throws the body away from whoever hit it. In a squad fight the
+      // stagger is the one opening worth noticing, and it used to be invisible:
+      // the state existed only inside the AI, so a cancelled telegraph looked
+      // exactly like a normal hit.
+      let staggerX = 0;
+      let staggerY = 0;
+      if (enemy.state === ENEMY_STATES.STAGGER && enemy.staggerTimer > 0) {
+        const lean = clamp(enemy.staggerTimer / 0.2, 0, 1) * 7;
+        staggerX = -Math.cos(enemy.lastHitAngle) * lean;
+        staggerY = -Math.sin(enemy.lastHitAngle) * lean;
+      }
+      ctx.translate(enemy.x + staggerX, enemy.y + staggerY);
       if (dying) {
         const t = clamp(1 - enemy.deathTimer / 1.4, 0, 1);
         ctx.globalAlpha = t * 0.8;
@@ -653,6 +664,39 @@ export class Renderer {
         ctx.stroke();
       }
 
+      // Elite ability sigil: a short-lived badge in the ability's colour, so an
+      // ability that already resolved is still readable a beat later, when the
+      // player is looking at what it did rather than at the caster.
+      if (enemy.abilityFx) {
+        const fx = enemy.abilityFx;
+        const life = clamp(fx.t / 0.5, 0, 1);
+        const pulse = clamp(fx.t / 0.45, 0, 1);
+        ctx.strokeStyle = rgba(fx.color, 0.35 + life * 0.5);
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(0, 0, r + 9 + (1 - pulse) * 10, 0, TAU);
+        ctx.stroke();
+        ctx.strokeStyle = rgba(fx.color, 0.2 + life * 0.35);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, r + 15 + (1 - pulse) * 6, 0, TAU);
+        ctx.stroke();
+        // A burst gets its fan drawn where it fired: the warning the ability
+        // never had, and the only reason a player learns which way it went.
+        if (fx.kind === ELITE_ABILITY.BURST) {
+          const angle = enemy.telegraphAngle ?? enemy.heading;
+          ctx.save();
+          ctx.globalAlpha = life * 0.5;
+          ctx.fillStyle = rgba(fx.color, 1);
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.arc(0, 0, r + 120 * (1 - pulse), angle - 0.5, angle + 0.5);
+          ctx.closePath();
+          ctx.fill();
+          ctx.restore();
+        }
+      }
+
       ctx.restore();
 
       // Health bars (elites, boss, or recently damaged enemies).
@@ -670,10 +714,14 @@ export class Renderer {
     ctx.globalAlpha = 0.25 + ratio * 0.35;
     const kind = enemy.isBoss ? enemy.pendingAttack?.kind : enemy.telegraphKind;
     const angle = enemy.telegraphAngle ?? enemy.heading;
-    if (kind === 'ranged' || kind === 'burst' || kind === 'sweep' || kind === 'charger') {
-      // Directional cone showing where the shot/charge will go.
-      const range = kind === 'charger' ? 220 : kind === 'ranged' ? Math.min(enemy.attackRange ?? 420, 460) : 420;
-      const half = kind === 'charger' ? 0.22 : kind === 'sweep' ? 0.5 : 0.24;
+    if (kind === 'ranged' || kind === 'burst' || kind === 'sweep' || kind === 'lance' || kind === 'charger') {
+      // Directional cone showing where the shot/charge will go. Lances reach
+      // across the arena, so their cone has to be long and narrow to read as
+      // "this one is aimed at you from here".
+      const range = kind === 'charger' ? 220
+        : kind === 'lance' ? 620
+          : kind === 'ranged' ? Math.min(enemy.attackRange ?? 420, 460) : 420;
+      const half = kind === 'charger' ? 0.22 : kind === 'sweep' ? 0.5 : kind === 'lance' ? 0.12 : 0.24;
       ctx.rotate(angle);
       ctx.fillStyle = rgba(color, 0.3);
       ctx.beginPath();
@@ -685,8 +733,12 @@ export class Renderer {
       ctx.lineWidth = 1.5;
       ctx.stroke();
     } else {
-      // Radial pulse for melee / slam.
-      const radius = kind === 'slam' ? 120 : enemy.radius + 26;
+      // Radial pulse for melee / slam / the endgame arena's ground pods. The
+      // slam radius comes from the attack spec so an arena can retune it
+      // without the warning circle misreporting the hitbox.
+      const radius = kind === 'slam' ? (enemy.pendingAttack?.radius ?? 120)
+        : kind === 'pods' ? 170
+          : enemy.radius + 26;
       ctx.strokeStyle = rgba(color, 0.8);
       ctx.lineWidth = 2.5;
       ctx.beginPath();

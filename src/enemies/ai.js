@@ -15,7 +15,9 @@
  */
 
 import { TAU, clamp, dist2, angleTo, rotateToward } from '../core/math.js';
-import { BOSS, ENEMY_STATES, ELITE_ABILITY } from '../config/enemies.js';
+import {
+  BOSS, ENEMY_STATES, ELITE_ABILITY, ELITE_ARCHETYPE_ABILITY,
+} from '../config/enemies.js';
 import { TEAM } from '../weapons/projectile.js';
 
 const LOS_INTERVAL = 0.14;
@@ -205,18 +207,62 @@ function updateStrafe(enemy, dt, ctx, distance, hasLos) {
   steerTo(enemy, dt, ctx, targetX, targetY, enemy.baseSpeed * 0.85);
 }
 
+/**
+ * Elite abilities. Exactly one draw is taken per telegraph attempt, and only
+ * for an elite that has not used its ability yet, so the hostile RNG stream is
+ * unchanged for every ordinary enemy.
+ *
+ * The ability is chosen from the archetype (heavies shield, ranged and chargers
+ * burst, melee leaders call for help) unless the elite modifier names one, and
+ * a champion's version is stronger — that is what makes an elite a different
+ * problem rather than the same enemy with a larger health bar.
+ */
+function triggerEliteAbility(enemy, ctx) {
+  if (!enemy.elite || enemy.eliteUsed) return;
+  if (!ctx.rng || !ctx.rng.bool(0.3)) return;
+  enemy.eliteUsed = true;
+  const ability = enemy.elite.ability ?? ELITE_ARCHETYPE_ABILITY[enemy.def.id];
+  const champion = enemy.eliteKey === 'champion';
+  if (ability === ELITE_ABILITY.SHIELD) {
+    enemy.addShield(Math.round(enemy.maxHealth * (champion ? 0.5 : 0.35)));
+  } else if (ability === ELITE_ABILITY.SUMMON && ctx.summon) {
+    // Melee leaders call in their own kind: bounded pressure that the squad
+    // composition already prepared the player for.
+    ctx.summon(enemy, 'husk', champion ? 3 : 2);
+  } else if (ability === ELITE_ABILITY.BURST && ctx.spawnProjectile) {
+    const count = champion ? 7 : 5;
+    const baseAngle = enemy.telegraphAngle ?? angleTo(enemy.x, enemy.y, ctx.player.x, ctx.player.y);
+    const spread = 0.9;
+    const muzzleX = enemy.x + Math.cos(baseAngle) * (enemy.radius + 6);
+    const muzzleY = enemy.y + Math.sin(baseAngle) * (enemy.radius + 6);
+    for (let i = 0; i < count; i += 1) {
+      const angle = baseAngle + (i / (count - 1) - 0.5) * spread;
+      ctx.spawnProjectile({
+        x: muzzleX,
+        y: muzzleY,
+        vx: Math.cos(angle) * 380,
+        vy: Math.sin(angle) * 380,
+        damage: enemy.baseDamage * 0.6,
+        radius: 5,
+        life: 1.1,
+        team: TEAM.HOSTILE,
+        color: enemy.accent,
+        width: 2.4,
+        glow: 1.5,
+      });
+    }
+  } else {
+    return;
+  }
+  if (ctx.onEliteAbility) ctx.onEliteAbility(enemy, ability);
+}
+
 function beginTelegraph(enemy, ctx, kind) {
   enemy.telegraphKind = kind;
   enemy.attackWindup = enemy.telegraphTime * (kind === 'heavy' ? 1.15 : 1);
   enemy.telegraphAngle = angleTo(enemy.x, enemy.y, ctx.player.x, ctx.player.y);
   enemy.setState(ENEMY_STATES.TELEGRAPH);
-  if (enemy.elite && !enemy.eliteUsed && ctx.rng && ctx.rng.bool(0.3)) {
-    enemy.eliteUsed = true;
-    if (enemy.elite.ability === ELITE_ABILITY.SHIELD) {
-      enemy.addShield(Math.round(enemy.maxHealth * 0.35));
-      if (ctx.onEliteAbility) ctx.onEliteAbility(enemy, 'shield');
-    }
-  }
+  triggerEliteAbility(enemy, ctx);
   if (ctx.onTelegraph) ctx.onTelegraph(enemy, kind);
 }
 
@@ -409,12 +455,21 @@ function updateBossAI(boss, dt, ctx) {
       const speed = boss.baseSpeed * (phase.speedMul ?? 1);
       boss.attackTimer -= dt;
       boss.summonTimer -= dt;
-      if (hasLos && distance <= boss.attackRange + player.radius + 24 && boss.attackTimer <= 0) {
+      const inMelee = hasLos && distance <= boss.attackRange + player.radius + 24;
+      // A boss pinned in melee range used to slam forever, which meant its
+      // phase attack list was never exercised. It now leads with the slam but
+      // never throws the same attack twice in a row, so the arena still sees
+      // bursts, sweeps and summons up close.
+      if (inMelee && boss.attackTimer <= 0 && boss.lastAttackKind !== 'slam') {
         beginBossAttack(boss, ctx, 'slam');
         return;
       }
       if (boss.attackTimer <= 0) {
-        const options = phase.attacks.filter((a) => a !== 'summon' || boss.summonTimer <= 0);
+        let options = phase.attacks.filter((a) => a !== 'summon' || boss.summonTimer <= 0);
+        if (inMelee) {
+          const withoutRepeat = options.filter((a) => a !== boss.lastAttackKind);
+          if (withoutRepeat.length > 0) options = withoutRepeat;
+        }
         const choice = ctx.rng
           ? ctx.rng.pick(options.length > 0 ? options : phase.attacks)
           : options[0] ?? 'burst';
@@ -433,31 +488,41 @@ function updateBossAI(boss, dt, ctx) {
   }
 }
 
+/**
+ * Attack parameters for this boss's arena: the base kit in `BOSS` merged with
+ * whatever the arena overrides or adds. Arenas therefore declare only deltas,
+ * and a new attack kind is one entry in the arena's `attacks` table plus its
+ * execution case below.
+ */
+function bossAttackSpec(boss, kind) {
+  const base = BOSS[kind] ?? {};
+  const override = boss.arena?.attacks?.[kind] ?? {};
+  return { ...base, ...override };
+}
+
+/** Attacks that aim where the player stands; the rest commit to a fixed spot. */
+const BOSS_TRACKING_ATTACKS = new Set(['slam', 'burst', 'sweep', 'lance', 'cage']);
+
 function beginBossAttack(boss, ctx, kind) {
-  const phase = boss.currentPhase;
-  let spec;
-  switch (kind) {
-    case 'slam':
-      spec = { kind, telegraph: BOSS.slam.telegraph, recover: BOSS.slam.recover, track: true };
-      break;
-    case 'burst':
-      spec = { kind, telegraph: BOSS.burst.telegraph, recover: BOSS.burst.recover, track: true };
-      break;
-    case 'sweep':
-      spec = { kind, telegraph: BOSS.sweep.telegraph, recover: BOSS.sweep.recover, track: true };
-      break;
-    case 'summon':
-      spec = { kind, telegraph: BOSS.summon.telegraph, recover: BOSS.summon.recover, track: false };
-      boss.summonTimer = 11;
-      break;
-    default:
-      throw new Error(`Unknown boss attack "${kind}"`);
+  const params = bossAttackSpec(boss, kind);
+  if (!Number.isFinite(params.telegraph) || !Number.isFinite(params.recover)) {
+    throw new Error(`Unknown boss attack "${kind}"`);
   }
+  const spec = {
+    kind,
+    telegraph: params.telegraph,
+    recover: params.recover,
+    track: BOSS_TRACKING_ATTACKS.has(kind),
+    // Read by the arena telegraph renderer, so an arena can retune a slam
+    // radius without the warning circle lying about it.
+    radius: params.radius,
+  };
+  if (kind === 'summon') boss.summonTimer = 11;
   boss.pendingAttack = spec;
+  boss.lastAttackKind = kind;
   boss.telegraphAngle = angleTo(boss.x, boss.y, ctx.player.x, ctx.player.y);
   boss.attackWindup = spec.telegraph;
   boss.setState(ENEMY_STATES.TELEGRAPH);
-  void phase;
   if (ctx.onBossTelegraph) ctx.onBossTelegraph(boss, kind, spec.telegraph);
 }
 
@@ -472,7 +537,7 @@ function executeBossAttack(boss, ctx) {
 
   switch (spec.kind) {
     case 'slam': {
-      const radius = BOSS.slam.radius;
+      const radius = bossAttackSpec(boss, 'slam').radius;
       if (ctx.onBossSlam) ctx.onBossSlam(boss, radius);
       if (dist2(boss.x, boss.y, player.x, player.y) <= (radius + player.radius) ** 2) {
         ctx.damagePlayer(boss.baseDamage * 1.35, { source: boss, kind: 'slam', bypassArmor: false });
@@ -484,7 +549,7 @@ function executeBossAttack(boss, ctx) {
       break;
     }
     case 'burst': {
-      const { projectiles, speed, damage } = BOSS.burst;
+      const { projectiles, speed, damage } = bossAttackSpec(boss, 'burst');
       for (let i = 0; i < projectiles; i += 1) {
         const a = angle + (i / projectiles) * TAU;
         ctx.spawnProjectile({
@@ -505,7 +570,7 @@ function executeBossAttack(boss, ctx) {
       break;
     }
     case 'sweep': {
-      const { projectiles, speed, damage, spread } = BOSS.sweep;
+      const { projectiles, speed, damage, spread } = bossAttackSpec(boss, 'sweep');
       for (let i = 0; i < projectiles; i += 1) {
         const a = angle + (i / (projectiles - 1) - 0.5) * spread;
         ctx.spawnProjectile({
@@ -526,7 +591,102 @@ function executeBossAttack(boss, ctx) {
       break;
     }
     case 'summon': {
-      if (ctx.onBossSummon) ctx.onBossSummon(boss, BOSS.summon.types, BOSS.summon.count);
+      const { types, count } = bossAttackSpec(boss, 'summon');
+      if (ctx.onBossSummon) ctx.onBossSummon(boss, types, count);
+      break;
+    }
+    // Endgame-arena kit: three fast aimed lances punish a player who kites the
+    // arena from the far wall, where burst and sweep never reach.
+    case 'lance': {
+      const { projectiles, spread, speed, damage } = bossAttackSpec(boss, 'lance');
+      for (let i = 0; i < projectiles; i += 1) {
+        const offset = projectiles > 1 ? (i / (projectiles - 1) - 0.5) * spread : 0;
+        const a = angle + offset;
+        ctx.spawnProjectile({
+          x: boss.x + Math.cos(a) * (boss.radius + 10),
+          y: boss.y + Math.sin(a) * (boss.radius + 10),
+          vx: Math.cos(a) * speed,
+          vy: Math.sin(a) * speed,
+          damage: damage * ctx.difficulty.damageMul,
+          radius: 5,
+          life: 3,
+          team: TEAM.HOSTILE,
+          color: '#ffd166',
+          width: 3.2,
+          glow: 1.9,
+        });
+      }
+      if (ctx.onBossBurst) ctx.onBossBurst(boss, projectiles);
+      break;
+    }
+    // A closing ring with one escape lane that alternates sides, so the answer
+    // is a read rather than a memorised dash direction.
+    case 'cage': {
+      const { projectiles, gap, speed, damage } = bossAttackSpec(boss, 'cage');
+      boss.cageSide = -(boss.cageSide ?? 1);
+      const gapCenter = angle + boss.cageSide * (Math.PI / 2);
+      let fired = 0;
+      for (let i = 0; i < projectiles; i += 1) {
+        const a = angle + (i / projectiles) * TAU;
+        if (Math.abs(angleDelta(a, gapCenter)) < gap / 2) continue;
+        ctx.spawnProjectile({
+          x: boss.x + Math.cos(a) * (boss.radius + 8),
+          y: boss.y + Math.sin(a) * (boss.radius + 8),
+          vx: Math.cos(a) * speed,
+          vy: Math.sin(a) * speed,
+          damage: damage * ctx.difficulty.damageMul,
+          radius: 6,
+          life: 3.2,
+          team: TEAM.HOSTILE,
+          color: BOSS.accent,
+          width: 2.6,
+          glow: 1.7,
+        });
+        fired += 1;
+      }
+      if (ctx.onBossBurst) ctx.onBossBurst(boss, fired);
+      break;
+    }
+    // Slag pods deny ground instead of chasing: they land around where the
+    // player stood and linger, so standing still is the thing that gets
+    // punished, not moving.
+    case 'pods': {
+      const {
+        count, minRadius, maxRadius, damage, life, radius,
+      } = bossAttackSpec(boss, 'pods');
+      const step = count > 1 ? (maxRadius - minRadius) / (count - 1) : 0;
+      let placed = 0;
+      for (let i = 0; i < count; i += 1) {
+        let px = 0;
+        let py = 0;
+        let ok = false;
+        // Pods must land on walkable ground. Each retry pulls the landing spot
+        // towards the boss and sweeps the angle to one side, so a blocked lane
+        // (wall, obstacle, prop) shifts its hazard instead of losing it.
+        for (let attempt = 0; attempt < 6 && !ok; attempt += 1) {
+          const a = angle + (i / count) * TAU + 0.35 + attempt * 0.45 * (i % 2 === 0 ? 1 : -1);
+          const dist = Math.max(minRadius * 0.6, maxRadius - i * step - attempt * 26);
+          px = boss.x + Math.cos(a) * dist;
+          py = boss.y + Math.sin(a) * dist;
+          ok = !ctx.map.circleCollides(px, py, radius);
+        }
+        if (!ok) continue;
+        ctx.spawnProjectile({
+          x: px,
+          y: py,
+          vx: 0,
+          vy: 0,
+          damage: damage * ctx.difficulty.damageMul,
+          radius,
+          life,
+          team: TEAM.HOSTILE,
+          color: '#ff6b5c',
+          width: 2.6,
+          glow: 2.1,
+        });
+        placed += 1;
+      }
+      if (ctx.onBossBurst) ctx.onBossBurst(boss, placed);
       break;
     }
     default:

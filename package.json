@@ -8,8 +8,7 @@
     "start": "node tools/serve.mjs",
     "dev": "node tools/serve.mjs",
     "test": "node tools/test.mjs",
-    "verify": "node tools/test.mjs && node tools/smoke.mjs",
-    "assets": "node tools/gen-assets.mjs"
+    "verify": "node tools/test.mjs && node tools/smoke.mjs"
   },
   "engines": {
     "node": ">=18"

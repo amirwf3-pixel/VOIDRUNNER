@@ -265,10 +265,21 @@ export const LOOTABLE_WEAPONS = ['smg', 'shotgun', 'rifle', 'railpiercer', 'brea
 
 export const WEAPON_IDS = Object.keys(WEAPONS);
 
+/**
+ * True only for ids this build actually defines.
+ *
+ * A bare `WEAPONS[id]` lookup also matches inherited object keys (`constructor`,
+ * `toString`, `__proto__`), which would let a malformed save entry become a
+ * "weapon" with no real definition instead of being dropped as unknown.
+ * @param {unknown} id
+ */
+export function isKnownWeaponId(id) {
+  return typeof id === 'string' && Object.prototype.hasOwnProperty.call(WEAPONS, id);
+}
+
 export function getWeaponDef(id) {
-  const def = WEAPONS[id];
-  if (!def) throw new Error(`Unknown weapon id: ${id}`);
-  return def;
+  if (!isKnownWeaponId(id)) throw new Error(`Unknown weapon id: ${id}`);
+  return WEAPONS[id];
 }
 
 export function roundsPerSecond(def) {

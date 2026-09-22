@@ -18,7 +18,15 @@ export class ObjectiveRuntime {
       ...def,
       progress: 0,
       complete: false,
-      markers: (def.markers ?? []).map((m) => ({ ...m, collected: false, id: null })),
+      // Markers keep a stable definition id so progress can be reported before
+      // (or without) the shard drops existing; `dropId` is filled in later by
+      // spawnMarkers and links a collected drop back to its marker.
+      markers: (def.markers ?? []).map((m, index) => ({
+        ...m,
+        collected: false,
+        id: `${def.id}:marker:${index}`,
+        dropId: null,
+      })),
       completionTime: 0,
     }));
     this.allComplete = false;
@@ -56,7 +64,7 @@ export class ObjectiveRuntime {
           radius: 16,
           objectiveId: objective.id,
         });
-        marker.id = drop.id;
+        marker.dropId = drop.id;
       }
     }
   }
@@ -95,10 +103,23 @@ export class ObjectiveRuntime {
     }
   }
 
-  /** Called when an enemy dies. */
-  onEnemyKilled() {
+  /**
+   * Called when an enemy dies.
+   *
+   * A purge objective counts every hostile; the commander objective counts one
+   * specific spawn, matched by its stable generator index so the same enemy is
+   * meant before and after a resume.
+   */
+  onEnemyKilled(enemy = null) {
+    let reported = false;
+    const hunt = this.objectives.find((o) => o.type === OBJECTIVE_TYPES.HUNT && !o.complete);
+    if (hunt && enemy && Number.isInteger(enemy.spawnIndex) && enemy.spawnIndex >= 0
+      && hunt.targetSpawnIndex === enemy.spawnIndex) {
+      this.setProgress(hunt, hunt.progress + 1);
+      reported = true;
+    }
     const objective = this.objectives.find((o) => o.type === OBJECTIVE_TYPES.ELIMINATE && !o.complete);
-    if (!objective) return false;
+    if (!objective) return reported;
     this.setProgress(objective, objective.progress + 1);
     return true;
   }
@@ -111,11 +132,16 @@ export class ObjectiveRuntime {
     return true;
   }
 
-  /** Called when a data shard drop with `objectiveId` is collected. */
-  onMarkerCollected(objectiveId, markerId) {
+  /**
+   * Called when a data shard drop with `objectiveId` is collected.
+   * @param {string} objectiveId
+   * @param {string|number} markerRef either a marker's stable id or the id of
+   *   the loot drop that was spawned for it.
+   */
+  onMarkerCollected(objectiveId, markerRef) {
     const objective = this.objectives.find((o) => o.id === objectiveId);
     if (!objective) return false;
-    const marker = objective.markers.find((m) => m.id === markerId);
+    const marker = objective.markers.find((m) => m.id === markerRef || (m.dropId !== null && m.dropId === markerRef));
     if (!marker || marker.collected) return false;
     marker.collected = true;
     this.setProgress(objective, objective.progress + 1);
@@ -153,6 +179,10 @@ export class ObjectiveRuntime {
     let detail = objective.description;
     if (objective.type === OBJECTIVE_TYPES.ELIMINATE) {
       detail = `Hostiles purged: ${objective.progress} / ${objective.target}`;
+    } else if (objective.type === OBJECTIVE_TYPES.HUNT) {
+      detail = objective.progress >= objective.target
+        ? 'Commander eliminated'
+        : 'Commander still active — locate and eliminate';
     } else if (objective.type === OBJECTIVE_TYPES.RECOVER) {
       detail = `Data shards recovered: ${objective.progress} / ${objective.target}`;
     } else if (objective.type === OBJECTIVE_TYPES.DESTROY) {
@@ -174,7 +204,12 @@ export class ObjectiveRuntime {
           out.push({ x: marker.x, y: marker.y, objectiveId: objective.id, type: objective.type });
         }
       } else {
-        out.push({ x: objective.position.x, y: objective.position.y, objectiveId: objective.id, type: objective.type });
+        // The commander marker follows the target itself, so the HUD arrow and
+        // the minimap point at the enemy and not at the room it was assigned.
+        const at = objective.type === OBJECTIVE_TYPES.HUNT && objective.targetPosition
+          ? objective.targetPosition
+          : objective.position;
+        out.push({ x: at.x, y: at.y, objectiveId: objective.id, type: objective.type });
       }
     }
     return out;
@@ -196,8 +231,19 @@ export class ObjectiveRuntime {
     };
   }
 
-  restore(data) {
+  /**
+   * @param {{objectives?: Array<{id:string,progress:number,complete:boolean}>, tier?:number}} data
+   * @param {number|null} [tier] sector the state is being restored into
+   * @returns {boolean} whether the state was applied
+   */
+  restore(data, tier = null) {
     if (!data || !Array.isArray(data.objectives)) return false;
+    // Objective ids ('objective-main') are reused by every tier, so a state
+    // that names another sector must never be applied here: matching by id
+    // alone would transplant progress onto unrelated content, and a completed
+    // foreign objective would open this sector's extraction gate. A state
+    // without a tier predates the scoping and stays accepted (legacy saves).
+    if (Number.isFinite(data.tier) && data.tier !== tier) return false;
     for (const saved of data.objectives) {
       const objective = this.objectives.find((o) => o.id === saved.id);
       if (!objective) continue;
